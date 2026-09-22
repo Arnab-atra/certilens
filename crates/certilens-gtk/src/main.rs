@@ -23,19 +23,34 @@ fn main() -> adw::glib::ExitCode {
         let header = adw::HeaderBar::new();
         toolbar_view.add_top_bar(&header);
 
-        // 4. The welcome label - put it in the ToolbarView's content slot.
+        // 4. The welcome label.
         let welcome = gtk::Label::builder()
             .label("Drop a document, or click Open")
             .build();
         welcome.set_vexpand(true);
         welcome.set_valign(gtk::Align::Center);
         welcome.set_halign(gtk::Align::Center);
+
+        // 5. Clone the label handle for the click handler.
+        //    Must come BEFORE the closure that uses it.
+        let welcome_for_click = welcome.clone();
+
+        // 6. The Open button + click handler.
+        let open_button = gtk::Button::builder().label("Open").build();
+
+        open_button.connect_clicked(move |_| {
+            welcome_for_click.set_text("Button was clicked");
+        });
+
+        header.pack_start(&open_button);
+
+        // 7. Put the welcome label into the ToolbarView's content slot.
         toolbar_view.set_content(Some(&welcome));
 
-        // 5. Attach the ToolbarView to the window as it child.
+        // 8. Attach the ToolbarView to the window as its child.
         window.set_content(Some(&toolbar_view));
 
-        // 6. Show the window
+        // 9. Show the window.
         window.present();
     });
 
