@@ -68,8 +68,6 @@ fn render_pdf_page_to_file(pdf_path: &Path, page: u32) -> Result<PathBuf, String
         ));
     }
 
-    // pdftoppm names the output `<prefix>-<n>.png`, where `<n>` may be
-    // zero-padded depending on the page count. Scan for a matching file.
     let prefix_name = prefix
         .file_name()
         .and_then(|s| s.to_str())
@@ -261,6 +259,23 @@ fn claims_card(report: &SignatureReport) -> gtk::Widget {
     }
     if report.contents_size > 0 {
         rows.push(("CMS blob".into(), format!("{} bytes", report.contents_size)));
+    }
+
+    // Where does this signature appear on the page?
+    if let Some([x0, y0, x1, y1]) = report.rect {
+        let w = x1 - x0;
+        let h = y1 - y0;
+        rows.push((
+            "Page".into(),
+            match report.page_number {
+                Some(p) => p.to_string(),
+                None => "unknown".into(),
+            },
+        ));
+        rows.push((
+            "Rect (points)".into(),
+            format!("[{x0:.0}, {y0:.0} → {x1:.0}, {y1:.0}]  ({w:.0} × {h:.0})"),
+        ));
     }
 
     for (k, v) in rows {
@@ -547,15 +562,12 @@ fn install_open_action(
                                 }
                                 println!();
 
-                                // Fill sidebar with verdict + evidence.
                                 let sidebar_widget = build_results_view(&assessment);
                                 sidebar_for_result.set_child(Some(&sidebar_widget));
 
-                                // Fill content with the rendered PDF page.
                                 let pdf_widget = build_pdf_view(&path);
                                 content_for_result.set_child(Some(&pdf_widget));
 
-                                // Show the sidebar now that we have content.
                                 split_view_for_result.set_show_sidebar(true);
                             }
                             Err(err) => {
@@ -651,16 +663,14 @@ fn main() -> adw::glib::ExitCode {
         let split_view = adw::OverlaySplitView::new();
         split_view.set_min_sidebar_width(360.0);
         split_view.set_max_sidebar_width(480.0);
-        split_view.set_show_sidebar(false); // hidden until a doc is opened
+        split_view.set_show_sidebar(false);
         toolbar_view.set_content(Some(&split_view));
 
-        // Content pane starts with a welcome message.
         let content_area = adw::Bin::new();
         let welcome = build_welcome_widget();
         content_area.set_child(Some(&welcome));
         split_view.set_content(Some(&content_area));
 
-        // Sidebar is empty at start.
         let sidebar_area = adw::Bin::new();
         split_view.set_sidebar(Some(&sidebar_area));
 

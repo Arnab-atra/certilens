@@ -38,6 +38,10 @@ pub struct SignatureReport {
     pub byte_range: Option<Vec<i64>>,
     pub contents_size: usize,
 
+    // Where does this signature appear on the page?
+    pub rect: Option<[f64; 4]>,
+    pub page_number: Option<usize>,
+
     // Check results
     pub integrity: CheckOutcome,
     pub signature: CheckOutcome,
@@ -127,6 +131,8 @@ pub fn assess(path: &Path) -> Result<Assessment, VerifyError> {
             location: sig.location.clone(),
             byte_range: sig.byte_range.clone(),
             contents_size: sig.contents_size,
+            rect: sig.rect,
+            page_number: sig.page_number,
             integrity: CheckOutcome::not_run(),
             signature: CheckOutcome::not_run(),
             certificate: CertificateSummary::default(),

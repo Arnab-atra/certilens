@@ -18,61 +18,36 @@ pub enum PdfError {
 }
 
 /// A signature field discovered in the PDF's AcroForm.
-///
-/// This is *not* a verified signature — it's just a form field that
-/// claims to be a signature. Phase 1d will attach its ByteRange.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignatureField {
-    /// Fully-qualified name, e.g. "Form.Signature1".
     pub name: String,
-    /// Object ID of the field's dictionary, if it was an indirect object.
     pub object_id: u32,
-    /// True if the field has a `/V` (a value — i.e. it was actually signed).
     pub has_value: bool,
 }
 
 /// Crypto-relevant details extracted from a signature's /V dictionary.
-///
-/// Everything here is a *claim by the document*. Nothing has been verified.
-/// Phase 2 will check these claims cryptographically.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignatureDetails {
-    /// Which AcroForm field this belongs to.
     pub field_name: String,
-
-    /// Object ID of the /V signature dictionary.
     pub object_id: u32,
-
-    /// /Filter — the signature handler, e.g. "Adobe.PPKLite".
     pub filter: Option<String>,
-
-    /// /SubFilter — how /Contents is encoded,
-    /// e.g. "adbe.pkcs7.detached".
     pub sub_filter: Option<String>,
-
-    /// /Name — claimed signer name. NOT verified.
     pub claimed_signer: Option<String>,
-
-    /// /M — claimed signing time (PDF date string). NOT verified.
     pub claimed_time: Option<String>,
-
-    /// /Reason — free-text "why signed".
     pub reason: Option<String>,
-
-    /// /Location — free-text "where signed".
     pub location: Option<String>,
-
-    /// /ByteRange — typically [start1, length1, start2, length2].
     pub byte_range: Option<Vec<i64>>,
-
-    /// Size, in bytes, of the decoded CMS blob.
     pub contents_size: usize,
-
-    /// File offset of the `<` that opens /Contents.
     pub contents_offset: Option<u64>,
-
-    /// Length, in bytes, of the hex string between `<` and `>`.
     pub contents_hex_length: Option<u64>,
+
+    // ---- Where does this signature appear? ----
+    /// The signature widget's rectangle on the page, in PDF points:
+    /// `[x0, y0, x1, y1]` with origin at the bottom-left of the page.
+    pub rect: Option<[f64; 4]>,
+
+    /// The 1-based page number this signature appears on.
+    pub page_number: Option<usize>,
 }
 
 /// A high-level summary of a PDF file.
@@ -84,8 +59,6 @@ pub struct PdfInfo {
     pub object_count: usize,
     pub signature_fields: Vec<SignatureField>,
     pub signature_details: Vec<SignatureDetails>,
-
-    // Phase 1b additions:
     pub file_size: usize,
     pub startxref_offset: Option<u64>,
     pub eof_marker_count: usize,
@@ -244,8 +217,6 @@ fn extract_signature_details(
             continue;
         }
 
-        // The field dict might be at the top level, or keyed differently.
-        // We look it up by ID to be safe.
         let Ok(field_obj) = doc.get_object((field.object_id, 0)) else {
             continue;
         };
@@ -289,10 +260,11 @@ fn extract_signature_details(
             .map(|s| s.len())
             .unwrap_or(0);
 
-        // Locate /Contents in the raw file to record its byte offset.
         let (contents_offset, contents_hex_length) = find_contents_span(raw_bytes, v_id.0)
             .map(|(off, len)| (Some(off), Some(len)))
             .unwrap_or((None, None));
+
+        let (rect, page_number) = extract_rect_and_page(doc, field_dict);
 
         out.push(SignatureDetails {
             field_name: field.name.clone(),
@@ -307,10 +279,72 @@ fn extract_signature_details(
             contents_size,
             contents_offset,
             contents_hex_length,
+            rect,
+            page_number,
         });
     }
 
     out
+}
+
+/// Extract the signature widget's rectangle and page number.
+///
+/// Tries the field dict directly (common case), then falls back to the
+/// first kid (rare field/widget split).
+fn extract_rect_and_page(
+    doc: &lopdf::Document,
+    field_dict: &lopdf::Dictionary,
+) -> (Option<[f64; 4]>, Option<usize>) {
+    // Try the field dict itself.
+    if let Some(rect) = rect_of(field_dict) {
+        let page = page_of(doc, field_dict);
+        return (Some(rect), page);
+    }
+
+    // Fall back to the first kid, if any.
+    if let Ok(kids) = field_dict.get(b"Kids").and_then(|o| o.as_array()) {
+        for kid in kids {
+            if let Some(kid_dict) = resolve(doc, kid).and_then(|o| o.as_dict().ok()) {
+                if let Some(rect) = rect_of(kid_dict) {
+                    let page = page_of(doc, kid_dict);
+                    return (Some(rect), page);
+                }
+            }
+        }
+    }
+
+    (None, None)
+}
+
+/// Read `/Rect` from a dict, if present and well-formed.
+fn rect_of(dict: &lopdf::Dictionary) -> Option<[f64; 4]> {
+    let arr = dict.get(b"Rect").ok()?.as_array().ok()?;
+    if arr.len() != 4 {
+        return None;
+    }
+    let mut out = [0.0f64; 4];
+    for (i, obj) in arr.iter().enumerate() {
+        out[i] = obj
+            .as_float()
+            .map(|f| f as f64)
+            .ok()
+            .or_else(|| obj.as_i64().ok().map(|n| n as f64))?;
+    }
+    Some(out)
+}
+
+/// Read `/P` from a dict and convert it to a 1-based page number.
+fn page_of(doc: &lopdf::Document, dict: &lopdf::Dictionary) -> Option<usize> {
+    let page_ref = match dict.get(b"P").ok()? {
+        lopdf::Object::Reference(id) => *id,
+        _ => return None,
+    };
+    for (num, id) in doc.get_pages() {
+        if id == page_ref {
+            return Some(num as usize);
+        }
+    }
+    None
 }
 
 /// Read a name from a dict key, e.g. /Filter /Adobe.PPKLite.
@@ -330,22 +364,17 @@ fn get_str(dict: &lopdf::Dictionary, key: &[u8]) -> Option<String> {
 }
 
 /// Find the byte span of the `/Contents <hex>` value for object `object_id`.
-///
-/// Returns `(offset_of_<, length_of_hex_inside_brackets)`.
 fn find_contents_span(raw: &[u8], object_id: u32) -> Option<(u64, u64)> {
-    // Locate "<id> 0 obj".
     let needle = format!("{object_id} 0 obj");
     let obj_start = find_subslice(raw, needle.as_bytes())?;
     let after = &raw[obj_start..];
 
-    // Bound our search to this object.
     let obj_end = find_subslice(after, b"endobj").unwrap_or(after.len());
     let obj = &after[..obj_end];
 
     let contents_pos = find_subslice(obj, b"/Contents")?;
     let mut i = contents_pos + b"/Contents".len();
 
-    // Skip whitespace.
     while i < obj.len() && obj[i].is_ascii_whitespace() {
         i += 1;
     }
@@ -368,18 +397,10 @@ fn find_contents_span(raw: &[u8], object_id: u32) -> Option<(u64, u64)> {
 }
 
 /// Decode the hex-encoded `/Contents` value into raw CMS bytes.
-///
-/// * `raw`      — the full PDF file bytes
-/// * `offset`   — byte position of the `<` that opens the hex string
-/// * `hex_len`  — number of hex characters between `<` and `>`
-///
-/// PDFs encode the CMS blob as hex so it survives 7-bit transports.
-/// The blob itself is ASN.1 DER (binary), so we decode here.
 pub fn extract_cms_bytes(raw: &[u8], offset: u64, hex_len: u64) -> Result<Vec<u8>, PdfError> {
     let offset = offset as usize;
     let hex_len = hex_len as usize;
 
-    // Bounds check: we need bytes at [offset, offset + 1 + hex_len).
     let end = offset
         .checked_add(1)
         .and_then(|o| o.checked_add(hex_len))
@@ -397,7 +418,6 @@ pub fn extract_cms_bytes(raw: &[u8], offset: u64, hex_len: u64) -> Result<Vec<u8
         )));
     }
 
-    // The `<` sits at `offset`. The hex digits are the next `hex_len` bytes.
     let hex_slice = &raw[offset + 1..end];
 
     let mut out = Vec::with_capacity(hex_len / 2);
@@ -408,7 +428,6 @@ pub fn extract_cms_bytes(raw: &[u8], offset: u64, hex_len: u64) -> Result<Vec<u8
             b'0'..=b'9' => b - b'0',
             b'a'..=b'f' => b - b'a' + 10,
             b'A'..=b'F' => b - b'A' + 10,
-            // Some writers pad the tail with whitespace; skip it.
             b' ' | b'\n' | b'\r' | b'\t' => continue,
             _ => {
                 return Err(PdfError::Io(std::io::Error::new(
@@ -424,11 +443,10 @@ pub fn extract_cms_bytes(raw: &[u8], offset: u64, hex_len: u64) -> Result<Vec<u8
         }
     }
 
-    // A trailing odd nibble would be a malformed hex string — drop it
-    // rather than guess. Real signers always pad even.
     Ok(out)
 }
-/// Naive substring search. Fine for a few MB; swap for `memchr` later if needed.
+
+/// Naive substring search.
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() {
         return Some(0);
@@ -442,8 +460,7 @@ fn count_eof_markers(bytes: &[u8]) -> usize {
     bytes.windows(MARKER.len()).filter(|w| *w == MARKER).count()
 }
 
-/// Locate the `startxref` marker near the end of the file and return
-/// the number that follows it.
+/// Locate the `startxref` marker near the end of the file.
 fn find_startxref_offset(bytes: &[u8]) -> Option<u64> {
     const MARKER: &[u8] = b"startxref";
     const SCAN: usize = 2048;
@@ -475,8 +492,6 @@ fn find_startxref_offset(bytes: &[u8]) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ---- Byte-level tests ----------------------------------------------
 
     #[test]
     fn counts_no_eof_markers() {
@@ -510,13 +525,6 @@ mod tests {
     fn returns_none_when_missing() {
         assert_eq!(find_startxref_offset(b"%PDF-1.4\n%%EOF\n"), None);
     }
-
-    // ---- Field-walker tests --------------------------------------------
-    //
-    // Build documents programmatically instead of parsing raw bytes.
-    // lopdf requires a valid xref table, which is tedious to hand-compute.
-    // The walker's job is to walk an already-parsed tree, so this tests
-    // exactly the code we care about.
 
     use lopdf::{dictionary, Object};
 
@@ -667,8 +675,6 @@ mod tests {
 
     #[test]
     fn extracts_cms_bytes_from_hex() {
-        // `<` at offset 0; "4E6F77" hex = "Now" bytes; `>` after.
-        // Real /Contents is much longer, but this exercises the decoder.
         let raw = b"<4E6F77>";
         let bytes = extract_cms_bytes(raw, 0, 6).expect("decode");
         assert_eq!(bytes, b"Now");
@@ -689,7 +695,6 @@ mod tests {
 
     #[test]
     fn skips_whitespace_inside_hex() {
-        // Some writers wrap long hex strings across lines.
         let raw = b"<4E 6F\n77>";
         let bytes = extract_cms_bytes(raw, 0, 8).expect("decode");
         assert_eq!(bytes, b"Now");
