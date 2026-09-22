@@ -1,3 +1,4 @@
+use adw::gio;
 use adw::gtk;
 use adw::prelude::*;
 use libadwaita as adw;
@@ -37,9 +38,34 @@ fn main() -> adw::glib::ExitCode {
 
         // 6. The Open button + click handler.
         let open_button = gtk::Button::builder().label("Open").build();
+        // Give the click handler its own handle to the window, so it can be
+        // the parent of the file dialog.
+        let window_for_dialog = window.clone();
 
         open_button.connect_clicked(move |_| {
-            welcome_for_click.set_text("Button was clicked");
+            let dialog = gtk::FileDialog::new();
+            dialog.set_title("Open a document");
+
+            let welcome_for_result = welcome_for_click.clone();
+
+            dialog.open(
+                Some(&window_for_dialog),
+                None::<&gio::Cancellable>,
+                move |result| match result {
+                    Ok(file) => {
+                        if let Some(path) = file.path() {
+                            println!("Selected: {}", path.display());
+                            welcome_for_result.set_text(&path.display().to_string());
+                        } else {
+                            welcome_for_result.set_text("Selected a non-file resource");
+                        }
+                    }
+                    Err(err) => {
+                        println!("Cancelled: {err}");
+                        welcome_for_result.set_text("No file selected");
+                    }
+                },
+            );
         });
 
         header.pack_start(&open_button);
