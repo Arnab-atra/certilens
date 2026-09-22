@@ -28,3 +28,45 @@
   font-size: 0.95em;
   opacity: 0.85;
 }
+
+.card {
+  background-color: alpha(currentColor, 0.05);
+  border-radius: 10px;
+  padding: 14px;
+}
+
+.section-title {
+  font-weight: 700;
+  font-size: 1.05em;
+  margin-bottom: 6px;
+}
+
+.kv-key {
+  opacity: 0.6;
+  font-size: 0.9em;
+}
+
+.kv-value {
+  font-size: 0.95em;
+}
+
+.kv-mono {
+  font-family: "JetBrains Mono", "Fira Code", "DejaVu Sans Mono", monospace;
+  font-size: 0.86em;
+}
+
+.inline-ok {
+  background-color: alpha(#2ec27e, 0.12);
+  color: #2ec27e;
+  padding: 8px 12px;
+  border-radius: 6px;
+  font-weight: 600;
+}
+
+.inline-warn {
+  background-color: alpha(#f5c211, 0.15);
+  color: #b58900;
+  padding: 8px 12px;
+  border-radius: 6px;
+  font-weight: 600;
+}

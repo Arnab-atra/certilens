@@ -2,13 +2,13 @@ use adw::gio;
 use adw::gtk;
 use adw::prelude::*;
 use certilens_core::VerificationResult;
+use certilens_verify::{
+    Assessment, CertificateSummary, ChainSummary, CheckOutcome, SignatureReport,
+};
 use libadwaita as adw;
 use std::sync::Once;
 
-/// The stylesheet, embedded at compile time.
 const CERTILENS_CSS: &str = include_str!("../resources/styles/certilens.css");
-
-/// Ensure the CSS provider is loaded exactly once.
 static CSS_LOADED: Once = Once::new();
 
 fn load_css() {
@@ -25,21 +25,297 @@ fn load_css() {
     });
 }
 
-/// The initial "drop a document" placeholder.
-fn build_welcome_widget() -> gtk::Widget {
-    let welcome = gtk::Label::builder()
-        .label("Drop a document, or click Open")
-        .wrap(true)
-        .justify(gtk::Justification::Center)
-        .build();
-    welcome.set_vexpand(true);
-    welcome.set_valign(gtk::Align::Center);
-    welcome.set_halign(gtk::Align::Center);
-    welcome.upcast()
+/// Insert thousands separators into an unsigned integer.
+/// 3485794 → "3,485,794"
+fn format_thousands(n: u64) -> String {
+    let s = n.to_string();
+    let len = s.len();
+    let mut out = String::with_capacity(len + len / 3);
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (len - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
 }
 
-/// A single-verdict card: colored border, headline, subtitle, issues.
-fn build_verdict_widget(verdict: &VerificationResult) -> gtk::Widget {
+// -----------------------------------------------------------------------------
+// Small widget helpers
+// -----------------------------------------------------------------------------
+
+fn section_title(text: &str) -> gtk::Label {
+    let l = gtk::Label::builder()
+        .label(text)
+        .halign(gtk::Align::Start)
+        .xalign(0.0)
+        .build();
+    l.add_css_class("section-title");
+    l
+}
+
+fn kv_row(key: &str, value: &str, mono: bool) -> gtk::Box {
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+
+    let k = gtk::Label::builder()
+        .label(key)
+        .halign(gtk::Align::Start)
+        .xalign(0.0)
+        .width_chars(16)
+        .build();
+    k.add_css_class("kv-key");
+
+    let v = gtk::Label::builder()
+        .label(value)
+        .halign(gtk::Align::Start)
+        .xalign(0.0)
+        .wrap(true)
+        .selectable(true)
+        .build();
+    v.add_css_class(if mono { "kv-mono" } else { "kv-value" });
+
+    row.append(&k);
+    row.append(&v);
+    row
+}
+
+fn inline_banner(text: &str, kind: &str) -> gtk::Label {
+    let l = gtk::Label::builder()
+        .label(text)
+        .halign(gtk::Align::Fill)
+        .xalign(0.0)
+        .wrap(true)
+        .build();
+    l.add_css_class(if kind == "ok" {
+        "inline-ok"
+    } else {
+        "inline-warn"
+    });
+    l
+}
+
+fn check_outcome_widget(outcome: &CheckOutcome) -> gtk::Widget {
+    let box_ = gtk::Box::new(gtk::Orientation::Vertical, 6);
+
+    let kind = if outcome.passed { "ok" } else { "warn" };
+    let mark = if outcome.passed { "✓" } else { "✗" };
+    box_.append(&inline_banner(
+        &format!("{mark}  {}", outcome.summary),
+        kind,
+    ));
+
+    for detail in &outcome.details {
+        let d = gtk::Label::builder()
+            .label(detail)
+            .halign(gtk::Align::Start)
+            .xalign(0.0)
+            .wrap(true)
+            .selectable(true)
+            .build();
+        d.add_css_class("kv-mono");
+        box_.append(&d);
+    }
+
+    box_.upcast()
+}
+
+// -----------------------------------------------------------------------------
+// Card builders
+// -----------------------------------------------------------------------------
+
+fn claims_card(report: &SignatureReport) -> gtk::Widget {
+    let card = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    card.add_css_class("card");
+
+    card.append(&section_title("Claims in the PDF"));
+
+    let mut rows: Vec<(String, String)> = Vec::new();
+
+    if let Some(v) = &report.filter {
+        rows.push(("Filter".into(), v.clone()));
+    }
+    if let Some(v) = &report.sub_filter {
+        rows.push(("SubFilter".into(), v.clone()));
+    }
+    if let Some(v) = &report.claimed_signer {
+        rows.push(("Claimed signer".into(), v.clone()));
+    }
+    if let Some(v) = &report.claimed_time {
+        rows.push(("Claimed time".into(), v.clone()));
+    }
+    if let Some(v) = &report.reason {
+        rows.push(("Reason".into(), v.clone()));
+    }
+    if let Some(v) = &report.location {
+        rows.push(("Location".into(), v.clone()));
+    }
+    if let Some(br) = &report.byte_range {
+        if br.len() == 4 {
+            let pretty = format!(
+                "[{}..{}] + [{}..{}]",
+                br[0],
+                br[0] + br[1],
+                br[2],
+                br[2] + br[3]
+            );
+            rows.push(("ByteRange".into(), pretty));
+            rows.push((
+                "Signed bytes".into(),
+                format!("{} bytes", format_thousands((br[1] + br[3]) as u64)),
+            ));
+        }
+    }
+    if report.contents_size > 0 {
+        rows.push(("CMS blob".into(), format!("{} bytes", report.contents_size)));
+    }
+
+    for (k, v) in rows {
+        card.append(&kv_row(&k, &v, false));
+    }
+
+    card.upcast()
+}
+
+fn integrity_card(report: &SignatureReport) -> gtk::Widget {
+    let card = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    card.add_css_class("card");
+    card.append(&section_title("Integrity — SHA-256 of signed bytes"));
+    card.append(&check_outcome_widget(&report.integrity));
+    card.upcast()
+}
+
+fn signature_card_check(report: &SignatureReport) -> gtk::Widget {
+    let card = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    card.add_css_class("card");
+    card.append(&section_title("Cryptographic signature"));
+    card.append(&check_outcome_widget(&report.signature));
+    card.upcast()
+}
+
+fn certificate_card(cert: &CertificateSummary) -> gtk::Widget {
+    let card = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    card.add_css_class("card");
+    card.append(&section_title("Signer certificate"));
+
+    if !cert.present {
+        card.append(&inline_banner(
+            &format!("✗  {}", cert.validity_note),
+            "warn",
+        ));
+        return card.upcast();
+    }
+
+    card.append(&kv_row("Subject", &cert.subject, false));
+    card.append(&kv_row("Issuer", &cert.issuer, false));
+    card.append(&kv_row("Serial", &cert.serial, true));
+    card.append(&kv_row("Not before", &cert.not_before, false));
+    card.append(&kv_row("Not after", &cert.not_after, false));
+    card.append(&kv_row("Public key", &cert.public_key_algo, false));
+    card.append(&kv_row("Signature", &cert.signature_algo, false));
+    card.append(&kv_row(
+        "DER size",
+        &format!("{} bytes", cert.der_length),
+        false,
+    ));
+
+    // Validity banner
+    if cert.validity_note.starts_with("expired") {
+        card.append(&inline_banner(
+            &format!("⚠  Certificate EXPIRED — {}", cert.validity_note),
+            "warn",
+        ));
+    } else if cert.validity_note == "currently valid" {
+        card.append(&inline_banner("✓  Certificate is currently valid", "ok"));
+    } else {
+        card.append(&inline_banner(
+            &format!("⚠  Certificate {}", cert.validity_note),
+            "warn",
+        ));
+    }
+
+    if let Some(note) = &cert.signing_time_note {
+        card.append(&inline_banner(&format!("⚠  {note}"), "warn"));
+    }
+
+    card.upcast()
+}
+
+fn chain_card(chain: &ChainSummary) -> gtk::Widget {
+    let card = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    card.add_css_class("card");
+    card.append(&section_title("Certificate chain"));
+
+    if chain.links.is_empty() {
+        card.append(&inline_banner("No chain information available", "warn"));
+        return card.upcast();
+    }
+
+    // Collect every error we print for individual links, so the summary
+    // line doesn't duplicate one of them.
+    let mut shown_errors: Vec<String> = Vec::new();
+
+    for (i, link) in chain.links.iter().enumerate() {
+        let role = if link.self_signed { "ROOT" } else { "cert" };
+        let origin = if link.from_trust_store {
+            "trust store"
+        } else {
+            "PDF"
+        };
+        let badge = if link.verified { "✓" } else { "⚠" };
+        let header = format!("{badge}  [{i}] {role}  (from {origin})");
+
+        let header_label = gtk::Label::builder()
+            .label(header)
+            .halign(gtk::Align::Start)
+            .xalign(0.0)
+            .build();
+        header_label.add_css_class("kv-key");
+        card.append(&header_label);
+
+        card.append(&kv_row("Subject", &link.subject, false));
+        if !link.self_signed {
+            card.append(&kv_row("Issuer", &link.issuer, false));
+        }
+        if let Some(err) = &link.error {
+            card.append(&inline_banner(&format!("⚠  {err}"), "warn"));
+            shown_errors.push(err.clone());
+        }
+    }
+
+    // Summary line — only if it adds new information beyond the link errors.
+    if chain.reached_trusted_root {
+        card.append(&inline_banner("✓  Chain reaches a trusted root", "ok"));
+    } else if !shown_errors.iter().any(|e| e == &chain.note) {
+        card.append(&inline_banner(&format!("⚠  {}", chain.note), "warn"));
+    }
+
+    card.upcast()
+}
+
+fn signature_card(report: &SignatureReport) -> gtk::Widget {
+    let card = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    card.add_css_class("card");
+    card.set_margin_bottom(12);
+
+    card.append(&section_title(&format!(
+        "Signature — {}",
+        report.field_name
+    )));
+
+    card.append(&claims_card(report));
+    card.append(&integrity_card(report));
+    card.append(&signature_card_check(report));
+    card.append(&certificate_card(&report.certificate));
+    card.append(&chain_card(&report.chain));
+
+    card.upcast()
+}
+
+// -----------------------------------------------------------------------------
+// Verdict + results
+// -----------------------------------------------------------------------------
+
+fn verdict_banner(verdict: &VerificationResult) -> gtk::Widget {
     let outer = gtk::Box::new(gtk::Orientation::Vertical, 6);
     outer.set_halign(gtk::Align::Fill);
     outer.set_valign(gtk::Align::Start);
@@ -87,6 +363,50 @@ fn build_verdict_widget(verdict: &VerificationResult) -> gtk::Widget {
     outer.upcast()
 }
 
+fn build_results_view(assessment: &Assessment) -> gtk::Widget {
+    let column = gtk::Box::new(gtk::Orientation::Vertical, 12);
+
+    column.append(&verdict_banner(&assessment.verdict));
+
+    for report in &assessment.signatures {
+        column.append(&signature_card(report));
+    }
+
+    // Wrap in a scrolled window.
+    let scrolled = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .vexpand(true)
+        .hexpand(true)
+        .build();
+
+    let padded = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    padded.set_margin_top(24);
+    padded.set_margin_bottom(24);
+    padded.set_margin_start(24);
+    padded.set_margin_end(24);
+    padded.append(&column);
+    scrolled.set_child(Some(&padded));
+
+    scrolled.upcast()
+}
+
+fn build_welcome_widget() -> gtk::Widget {
+    let welcome = gtk::Label::builder()
+        .label("Drop a document, or click Open")
+        .wrap(true)
+        .justify(gtk::Justification::Center)
+        .build();
+    welcome.set_vexpand(true);
+    welcome.set_valign(gtk::Align::Center);
+    welcome.set_halign(gtk::Align::Center);
+    welcome.upcast()
+}
+
+// -----------------------------------------------------------------------------
+// main
+// -----------------------------------------------------------------------------
+
 fn main() -> adw::glib::ExitCode {
     let app = adw::Application::builder()
         .application_id("io.github.arnab-atra.Certilens")
@@ -95,7 +415,6 @@ fn main() -> adw::glib::ExitCode {
     app.connect_activate(|app| {
         load_css();
 
-        // 1. Window
         let window = adw::ApplicationWindow::builder()
             .application(app)
             .title("CertiLens")
@@ -103,24 +422,19 @@ fn main() -> adw::glib::ExitCode {
             .default_height(700)
             .build();
 
-        // 2. ToolbarView
         let toolbar_view = adw::ToolbarView::new();
 
-        // 3. HeaderBar
         let header = adw::HeaderBar::new();
         toolbar_view.add_top_bar(&header);
 
-        // 4. Content area — holds welcome OR verdict
         let content_area = adw::Bin::new();
         let welcome = build_welcome_widget();
         content_area.set_child(Some(&welcome));
         toolbar_view.set_content(Some(&content_area));
 
-        // 5. Clones for closures
         let content_area_for_click = content_area.clone();
         let window_for_dialog = window.clone();
 
-        // 6. Open button + click handler
         let open_button = gtk::Button::builder().label("Open").build();
         open_button.connect_clicked(move |_| {
             let dialog = gtk::FileDialog::new();
@@ -138,7 +452,8 @@ fn main() -> adw::glib::ExitCode {
                             println!("Running verification...");
 
                             match certilens_verify::assess(&path) {
-                                Ok(verdict) => {
+                                Ok(assessment) => {
+                                    let verdict = &assessment.verdict;
                                     println!("Verdict: {}", verdict.headline);
                                     println!("Subtitle: {}", verdict.subtitle);
                                     if verdict.issues.is_empty() {
@@ -150,7 +465,7 @@ fn main() -> adw::glib::ExitCode {
                                     }
                                     println!();
 
-                                    let widget = build_verdict_widget(&verdict);
+                                    let widget = build_results_view(&assessment);
                                     content_area_for_result.set_child(Some(&widget));
                                 }
                                 Err(err) => {
@@ -166,8 +481,6 @@ fn main() -> adw::glib::ExitCode {
                                     content_area_for_result.set_child(Some(&label));
                                 }
                             }
-                        } else {
-                            println!("Non-file resource selected");
                         }
                     }
                     Err(err) => {
@@ -178,10 +491,7 @@ fn main() -> adw::glib::ExitCode {
         });
         header.pack_start(&open_button);
 
-        // 7. Attach to window
         window.set_content(Some(&toolbar_view));
-
-        // 8. Show
         window.present();
     });
 
