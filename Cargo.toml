@@ -4,7 +4,8 @@ members = [
     "crates/certilens-core",
     "crates/certilens-pdf",
     "crates/certilens-crypto",
-    "crates/certilens-python", "crates/certilens-gtk", "crates/certilens-verify",
+    "crates/certilens-verify",
+    "crates/certilens-gtk",
 ]
 
 [workspace.package]
@@ -17,7 +18,6 @@ authors = ["CertiLens contributors"]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "1"
-pyo3 = { version = "0.22", features = ["extension-module", "abi3-py310"] }
 lopdf = "0.34"
 sha2 = { version = "0.10", features = ["oid"] }
 cms = "0.2"

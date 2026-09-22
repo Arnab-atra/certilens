@@ -4,24 +4,6 @@
 # Rust backup files
 **/*.rs.bk
 
-# Python environment and cache
-.venv/
-venv/
-__pycache__/
-*.py[cod]
-*.egg-info/
-build/
-dist/
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-
-# Maturin
-/target/wheels/
-# Compiled Python extensions
-*.so
-*.pyd
-
 # Editors
 *.swp
 *.swo
