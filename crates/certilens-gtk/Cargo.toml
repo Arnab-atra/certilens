@@ -11,3 +11,4 @@ libadwaita = { version = "0.9.2", features = ["v1_9", "gtk_v4_22"] }
 certilens-pdf = { path = "../certilens-pdf" }
 certilens-verify = { path = "../certilens-verify" }
 certilens-core = { path = "../certilens-core" }
+poppler = { version = "0.6.0", features = ["render"] }

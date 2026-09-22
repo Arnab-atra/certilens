@@ -6,6 +6,7 @@ use certilens_verify::{
     Assessment, CertificateSummary, ChainSummary, CheckOutcome, SignatureReport,
 };
 use libadwaita as adw;
+use std::path::{Path, PathBuf};
 use std::sync::Once;
 
 const CERTILENS_CSS: &str = include_str!("../resources/styles/certilens.css");
@@ -38,6 +39,99 @@ fn format_thousands(n: u64) -> String {
         out.push(c);
     }
     out
+}
+
+/// Render page `page` (1-indexed) of `pdf_path` to a temporary PNG file.
+///
+/// Uses the system `pdftoppm` (from the poppler-utils package). Returns
+/// the path to the produced PNG, or an error message.
+fn render_pdf_page_to_file(pdf_path: &Path, page: u32) -> Result<PathBuf, String> {
+    let dir = std::env::temp_dir();
+    let pid = std::process::id();
+    let prefix = dir.join(format!("certilens-page-{pid}-{page}"));
+
+    let output = std::process::Command::new("pdftoppm")
+        .args(["-png", "-r", "150"])
+        .arg("-f")
+        .arg(page.to_string())
+        .arg("-l")
+        .arg(page.to_string())
+        .arg(pdf_path)
+        .arg(&prefix)
+        .output()
+        .map_err(|e| format!("Could not run pdftoppm: {e}"))?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "pdftoppm failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    // pdftoppm names the output `<prefix>-<n>.png`, where `<n>` may be
+    // zero-padded depending on the page count. Scan for a matching file.
+    let prefix_name = prefix
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| "invalid temp path".to_string())?
+        .to_string();
+
+    let entries = std::fs::read_dir(&dir).map_err(|e| e.to_string())?;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if name_str.starts_with(&prefix_name) && name_str.ends_with(".png") {
+            return Ok(entry.path());
+        }
+    }
+
+    Err("pdftoppm produced no output".into())
+}
+
+/// Build a widget that shows the first page of the PDF at `pdf_path`.
+fn build_pdf_view(pdf_path: &Path) -> gtk::Widget {
+    let png_path = match render_pdf_page_to_file(pdf_path, 1) {
+        Ok(p) => p,
+        Err(e) => {
+            let label = gtk::Label::builder()
+                .label(format!("Could not render PDF:\n{e}"))
+                .wrap(true)
+                .justify(gtk::Justification::Center)
+                .build();
+            label.set_vexpand(true);
+            label.set_valign(gtk::Align::Center);
+            return label.upcast();
+        }
+    };
+
+    let texture = match gtk::gdk::Texture::from_filename(&png_path) {
+        Ok(t) => t,
+        Err(e) => {
+            let label = gtk::Label::new(Some(&format!("Could not load page image: {e}")));
+            return label.upcast();
+        }
+    };
+
+    let picture = gtk::Picture::for_paintable(&texture);
+    picture.set_can_shrink(true);
+    picture.set_content_fit(gtk::ContentFit::Contain);
+
+    let scrolled = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Automatic)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .vexpand(true)
+        .hexpand(true)
+        .build();
+
+    let padded = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    padded.set_margin_top(16);
+    padded.set_margin_bottom(16);
+    padded.set_margin_start(16);
+    padded.set_margin_end(16);
+    padded.append(&picture);
+    scrolled.set_child(Some(&padded));
+
+    scrolled.upcast()
 }
 
 // -----------------------------------------------------------------------------
@@ -361,12 +455,18 @@ fn verdict_banner(verdict: &VerificationResult) -> gtk::Widget {
 
 fn build_results_view(assessment: &Assessment) -> gtk::Widget {
     let column = gtk::Box::new(gtk::Orientation::Vertical, 12);
-
     column.append(&verdict_banner(&assessment.verdict));
 
     for report in &assessment.signatures {
         column.append(&signature_card(report));
     }
+
+    let padded = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    padded.set_margin_top(16);
+    padded.set_margin_bottom(16);
+    padded.set_margin_start(16);
+    padded.set_margin_end(16);
+    padded.append(&column);
 
     let scrolled = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Never)
@@ -374,13 +474,6 @@ fn build_results_view(assessment: &Assessment) -> gtk::Widget {
         .vexpand(true)
         .hexpand(true)
         .build();
-
-    let padded = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    padded.set_margin_top(24);
-    padded.set_margin_bottom(24);
-    padded.set_margin_start(24);
-    padded.set_margin_end(24);
-    padded.append(&column);
     scrolled.set_child(Some(&padded));
 
     scrolled.upcast()
@@ -407,22 +500,28 @@ fn build_welcome_widget() -> gtk::Widget {
 /// Single entry point for opening a file, used by:
 ///   - the Open button in the header bar
 ///   - Ctrl+O
-///   - the menu item "Open" (added in Milestone B)
+///   - the menu item "Open…"
 fn install_open_action(
     app: &adw::Application,
+    split_view: &adw::OverlaySplitView,
+    sidebar_area: &adw::Bin,
     content_area: &adw::Bin,
     window: &adw::ApplicationWindow,
 ) {
     let action = gio::SimpleAction::new("open", None);
 
-    let content_area_for_action = content_area.clone();
+    let split_view_for_action = split_view.clone();
+    let sidebar_for_action = sidebar_area.clone();
+    let content_for_action = content_area.clone();
     let window_for_action = window.clone();
 
     action.connect_activate(move |_, _| {
         let dialog = gtk::FileDialog::new();
         dialog.set_title("Open a document");
 
-        let content_area_for_result = content_area_for_action.clone();
+        let split_view_for_result = split_view_for_action.clone();
+        let sidebar_for_result = sidebar_for_action.clone();
+        let content_for_result = content_for_action.clone();
         let window_for_dialog = window_for_action.clone();
 
         dialog.open(
@@ -448,8 +547,16 @@ fn install_open_action(
                                 }
                                 println!();
 
-                                let widget = build_results_view(&assessment);
-                                content_area_for_result.set_child(Some(&widget));
+                                // Fill sidebar with verdict + evidence.
+                                let sidebar_widget = build_results_view(&assessment);
+                                sidebar_for_result.set_child(Some(&sidebar_widget));
+
+                                // Fill content with the rendered PDF page.
+                                let pdf_widget = build_pdf_view(&path);
+                                content_for_result.set_child(Some(&pdf_widget));
+
+                                // Show the sidebar now that we have content.
+                                split_view_for_result.set_show_sidebar(true);
                             }
                             Err(err) => {
                                 println!("Assessment failed: {err}");
@@ -461,7 +568,8 @@ fn install_open_action(
                                 label.set_vexpand(true);
                                 label.set_valign(gtk::Align::Center);
                                 label.set_halign(gtk::Align::Center);
-                                content_area_for_result.set_child(Some(&label));
+                                content_for_result.set_child(Some(&label));
+                                split_view_for_result.set_show_sidebar(false);
                             }
                         }
                     }
@@ -474,8 +582,6 @@ fn install_open_action(
     });
 
     app.add_action(&action);
-
-    // Ctrl+O triggers it.
     app.set_accels_for_action("app.open", &["<Control>o"]);
 }
 
@@ -490,7 +596,7 @@ fn install_quit_action(app: &adw::Application) {
     app.set_accels_for_action("app.quit", &["<Control>q"]);
 }
 
-/// Install and "about" action that show About dialog.
+/// Install an "about" action that shows the About dialog.
 fn install_about_action(app: &adw::Application, parent: &adw::ApplicationWindow) {
     let action = gio::SimpleAction::new("about", None);
     let parent_for_action = parent.clone();
@@ -502,9 +608,8 @@ fn install_about_action(app: &adw::Application, parent: &adw::ApplicationWindow)
             .developer_name("Arnab Patra")
             .version(env!("CARGO_PKG_VERSION"))
             .comments(
-                "Loacl-first PDF signature verifier for GNOME.\n\n
-                Display the verdicity and the evidence behind it, without \
-                uploading anything.",
+                "Local-first PDF signature verifier for GNOME.\n\n\
+                 Displays the verdict and the evidence behind it, without uploading anything.",
             )
             .website("https://github.com/Arnab-atra/certilens")
             .issue_url("https://github.com/Arnab-atra/certilens/issues")
@@ -533,8 +638,8 @@ fn main() -> adw::glib::ExitCode {
         let window = adw::ApplicationWindow::builder()
             .application(app)
             .title("CertiLens")
-            .default_width(1100)
-            .default_height(700)
+            .default_width(1200)
+            .default_height(800)
             .build();
 
         let toolbar_view = adw::ToolbarView::new();
@@ -542,26 +647,37 @@ fn main() -> adw::glib::ExitCode {
         let header = adw::HeaderBar::new();
         toolbar_view.add_top_bar(&header);
 
+        // --- The split view ---------------------------------------------------
+        let split_view = adw::OverlaySplitView::new();
+        split_view.set_min_sidebar_width(360.0);
+        split_view.set_max_sidebar_width(480.0);
+        split_view.set_show_sidebar(false); // hidden until a doc is opened
+        toolbar_view.set_content(Some(&split_view));
+
+        // Content pane starts with a welcome message.
         let content_area = adw::Bin::new();
         let welcome = build_welcome_widget();
         content_area.set_child(Some(&welcome));
-        toolbar_view.set_content(Some(&content_area));
+        split_view.set_content(Some(&content_area));
 
-        // Install actions now that we have the content area and window.
-        install_open_action(app, &content_area, &window);
+        // Sidebar is empty at start.
+        let sidebar_area = adw::Bin::new();
+        split_view.set_sidebar(Some(&sidebar_area));
+
+        // --- Actions ---------------------------------------------------------
+        install_open_action(app, &split_view, &sidebar_area, &content_area, &window);
         install_quit_action(app);
         install_about_action(app, &window);
 
-        // The Open button triggers the "app.open" action — no click handler.
+        // --- Button + menu ---------------------------------------------------
         let open_button = gtk::Button::builder()
             .label("Open")
             .action_name("app.open")
             .build();
         header.pack_start(&open_button);
 
-        // The menu button on the right side of the header bar.
         let menu = gio::Menu::new();
-        menu.append(Some("Open…"), Some("app,open"));
+        menu.append(Some("Open…"), Some("app.open"));
         menu.append(Some("About CertiLens"), Some("app.about"));
 
         let menu_button = gtk::MenuButton::builder()
