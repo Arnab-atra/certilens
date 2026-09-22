@@ -56,21 +56,35 @@ fn main() -> adw::glib::ExitCode {
                     Ok(file) => {
                         if let Some(path) = file.path() {
                             println!("Selected: {}", path.display());
+                            println!("Running verification...");
 
-                            match certilens_pdf::inspect(&path) {
-                                Ok(info) => {
-                                    let summary = format!(
-                                        "{}\n\nPages: {}\nObjects: {}\nSignatures: {}",
-                                        path.display(),
-                                        info.pages,
-                                        info.object_count,
-                                        info.signature_fields.len(),
-                                    );
-                                    welcome_for_result.set_text(&summary);
+                            match certilens_verify::assess(&path) {
+                                Ok(verdict) => {
+                                    println!("Verdict: {}", verdict.headline);
+                                    println!("Subtitle: {}", verdict.subtitle);
+                                    if verdict.issues.is_empty() {
+                                        println!("  (no issues)");
+                                    } else {
+                                        for issue in &verdict.issues {
+                                            println!("  • {issue}");
+                                        }
+                                    }
+                                    println!();
+
+                                    let mut text =
+                                        format!("{}\n\n{}", verdict.headline, verdict.subtitle);
+                                    if !verdict.issues.is_empty() {
+                                        text.push_str("\n\n");
+                                        for issue in &verdict.issues {
+                                            text.push_str(&format!("• {issue}\n"));
+                                        }
+                                    }
+                                    welcome_for_result.set_text(&text);
                                 }
                                 Err(err) => {
+                                    println!("Assessment failed: {err}");
                                     welcome_for_result
-                                        .set_text(&format!("Failed to inspect PDF:\n{err}"));
+                                        .set_text(&format!("Assessment failed:\n{err}"));
                                 }
                             }
                         } else {

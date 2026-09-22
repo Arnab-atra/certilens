@@ -109,6 +109,7 @@ name = "certilens-gtk"
 version = "0.1.0"
 dependencies = [
  "certilens-pdf",
+ "certilens-verify",
  "gtk4",
  "libadwaita",
 ]
