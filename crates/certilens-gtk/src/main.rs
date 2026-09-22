@@ -218,7 +218,6 @@ fn certificate_card(cert: &CertificateSummary) -> gtk::Widget {
         false,
     ));
 
-    // Validity banner
     if cert.validity_note.starts_with("expired") {
         card.append(&inline_banner(
             &format!("⚠  Certificate EXPIRED — {}", cert.validity_note),
@@ -250,8 +249,6 @@ fn chain_card(chain: &ChainSummary) -> gtk::Widget {
         return card.upcast();
     }
 
-    // Collect every error we print for individual links, so the summary
-    // line doesn't duplicate one of them.
     let mut shown_errors: Vec<String> = Vec::new();
 
     for (i, link) in chain.links.iter().enumerate() {
@@ -282,7 +279,6 @@ fn chain_card(chain: &ChainSummary) -> gtk::Widget {
         }
     }
 
-    // Summary line — only if it adds new information beyond the link errors.
     if chain.reached_trusted_root {
         card.append(&inline_banner("✓  Chain reaches a trusted root", "ok"));
     } else if !shown_errors.iter().any(|e| e == &chain.note) {
@@ -372,7 +368,6 @@ fn build_results_view(assessment: &Assessment) -> gtk::Widget {
         column.append(&signature_card(report));
     }
 
-    // Wrap in a scrolled window.
     let scrolled = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Never)
         .vscrollbar_policy(gtk::PolicyType::Automatic)
@@ -404,6 +399,126 @@ fn build_welcome_widget() -> gtk::Widget {
 }
 
 // -----------------------------------------------------------------------------
+// Actions
+// -----------------------------------------------------------------------------
+
+/// Wire up the "open a document" logic as an application action.
+///
+/// Single entry point for opening a file, used by:
+///   - the Open button in the header bar
+///   - Ctrl+O
+///   - the menu item "Open" (added in Milestone B)
+fn install_open_action(
+    app: &adw::Application,
+    content_area: &adw::Bin,
+    window: &adw::ApplicationWindow,
+) {
+    let action = gio::SimpleAction::new("open", None);
+
+    let content_area_for_action = content_area.clone();
+    let window_for_action = window.clone();
+
+    action.connect_activate(move |_, _| {
+        let dialog = gtk::FileDialog::new();
+        dialog.set_title("Open a document");
+
+        let content_area_for_result = content_area_for_action.clone();
+        let window_for_dialog = window_for_action.clone();
+
+        dialog.open(
+            Some(&window_for_dialog),
+            None::<&gio::Cancellable>,
+            move |result| match result {
+                Ok(file) => {
+                    if let Some(path) = file.path() {
+                        println!("Selected: {}", path.display());
+                        println!("Running verification...");
+
+                        match certilens_verify::assess(&path) {
+                            Ok(assessment) => {
+                                let verdict = &assessment.verdict;
+                                println!("Verdict: {}", verdict.headline);
+                                println!("Subtitle: {}", verdict.subtitle);
+                                if verdict.issues.is_empty() {
+                                    println!("  (no issues)");
+                                } else {
+                                    for issue in &verdict.issues {
+                                        println!("  • {issue}");
+                                    }
+                                }
+                                println!();
+
+                                let widget = build_results_view(&assessment);
+                                content_area_for_result.set_child(Some(&widget));
+                            }
+                            Err(err) => {
+                                println!("Assessment failed: {err}");
+                                let label = gtk::Label::builder()
+                                    .label(format!("Assessment failed:\n{err}"))
+                                    .wrap(true)
+                                    .justify(gtk::Justification::Center)
+                                    .build();
+                                label.set_vexpand(true);
+                                label.set_valign(gtk::Align::Center);
+                                label.set_halign(gtk::Align::Center);
+                                content_area_for_result.set_child(Some(&label));
+                            }
+                        }
+                    }
+                }
+                Err(err) => {
+                    println!("Cancelled: {err}");
+                }
+            },
+        );
+    });
+
+    app.add_action(&action);
+
+    // Ctrl+O triggers it.
+    app.set_accels_for_action("app.open", &["<Control>o"]);
+}
+
+/// Install a "quit" action, triggered by Ctrl+Q.
+fn install_quit_action(app: &adw::Application) {
+    let action = gio::SimpleAction::new("quit", None);
+    let app_for_action = app.clone();
+    action.connect_activate(move |_, _| {
+        app_for_action.quit();
+    });
+    app.add_action(&action);
+    app.set_accels_for_action("app.quit", &["<Control>q"]);
+}
+
+/// Install and "about" action that show About dialog.
+fn install_about_action(app: &adw::Application, parent: &adw::ApplicationWindow) {
+    let action = gio::SimpleAction::new("about", None);
+    let parent_for_action = parent.clone();
+
+    action.connect_activate(move |_, _| {
+        let about = adw::AboutDialog::builder()
+            .application_name("CertiLens")
+            .application_icon("io.github.arnab-atra.Certilens")
+            .developer_name("Arnab Patra")
+            .version(env!("CARGO_PKG_VERSION"))
+            .comments(
+                "Loacl-first PDF signature verifier for GNOME.\n\n
+                Display the verdicity and the evidence behind it, without \
+                uploading anything.",
+            )
+            .website("https://github.com/Arnab-atra/certilens")
+            .issue_url("https://github.com/Arnab-atra/certilens/issues")
+            .copyright("© 2026 Arnab Patra")
+            .license_type(gtk::License::MitX11)
+            .build();
+
+        about.present(Some(&parent_for_action));
+    });
+
+    app.add_action(&action);
+}
+
+// -----------------------------------------------------------------------------
 // main
 // -----------------------------------------------------------------------------
 
@@ -432,64 +547,29 @@ fn main() -> adw::glib::ExitCode {
         content_area.set_child(Some(&welcome));
         toolbar_view.set_content(Some(&content_area));
 
-        let content_area_for_click = content_area.clone();
-        let window_for_dialog = window.clone();
+        // Install actions now that we have the content area and window.
+        install_open_action(app, &content_area, &window);
+        install_quit_action(app);
+        install_about_action(app, &window);
 
-        let open_button = gtk::Button::builder().label("Open").build();
-        open_button.connect_clicked(move |_| {
-            let dialog = gtk::FileDialog::new();
-            dialog.set_title("Open a document");
-
-            let content_area_for_result = content_area_for_click.clone();
-
-            dialog.open(
-                Some(&window_for_dialog),
-                None::<&gio::Cancellable>,
-                move |result| match result {
-                    Ok(file) => {
-                        if let Some(path) = file.path() {
-                            println!("Selected: {}", path.display());
-                            println!("Running verification...");
-
-                            match certilens_verify::assess(&path) {
-                                Ok(assessment) => {
-                                    let verdict = &assessment.verdict;
-                                    println!("Verdict: {}", verdict.headline);
-                                    println!("Subtitle: {}", verdict.subtitle);
-                                    if verdict.issues.is_empty() {
-                                        println!("  (no issues)");
-                                    } else {
-                                        for issue in &verdict.issues {
-                                            println!("  • {issue}");
-                                        }
-                                    }
-                                    println!();
-
-                                    let widget = build_results_view(&assessment);
-                                    content_area_for_result.set_child(Some(&widget));
-                                }
-                                Err(err) => {
-                                    println!("Assessment failed: {err}");
-                                    let label = gtk::Label::builder()
-                                        .label(format!("Assessment failed:\n{err}"))
-                                        .wrap(true)
-                                        .justify(gtk::Justification::Center)
-                                        .build();
-                                    label.set_vexpand(true);
-                                    label.set_valign(gtk::Align::Center);
-                                    label.set_halign(gtk::Align::Center);
-                                    content_area_for_result.set_child(Some(&label));
-                                }
-                            }
-                        }
-                    }
-                    Err(err) => {
-                        println!("Cancelled: {err}");
-                    }
-                },
-            );
-        });
+        // The Open button triggers the "app.open" action — no click handler.
+        let open_button = gtk::Button::builder()
+            .label("Open")
+            .action_name("app.open")
+            .build();
         header.pack_start(&open_button);
+
+        // The menu button on the right side of the header bar.
+        let menu = gio::Menu::new();
+        menu.append(Some("Open…"), Some("app,open"));
+        menu.append(Some("About CertiLens"), Some("app.about"));
+
+        let menu_button = gtk::MenuButton::builder()
+            .icon_name("open-menu-symbolic")
+            .menu_model(&menu)
+            .tooltip_text("Main Menu")
+            .build();
+        header.pack_end(&menu_button);
 
         window.set_content(Some(&toolbar_view));
         window.present();
