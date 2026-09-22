@@ -108,6 +108,7 @@ dependencies = [
 name = "certilens-gtk"
 version = "0.1.0"
 dependencies = [
+ "certilens-pdf",
  "gtk4",
  "libadwaita",
 ]

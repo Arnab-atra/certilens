@@ -27,20 +27,21 @@ fn main() -> adw::glib::ExitCode {
         // 4. The welcome label.
         let welcome = gtk::Label::builder()
             .label("Drop a document, or click Open")
+            .wrap(true)
+            .justify(gtk::Justification::Center)
             .build();
         welcome.set_vexpand(true);
         welcome.set_valign(gtk::Align::Center);
         welcome.set_halign(gtk::Align::Center);
 
         // 5. Clone the label handle for the click handler.
-        //    Must come BEFORE the closure that uses it.
         let welcome_for_click = welcome.clone();
 
-        // 6. The Open button + click handler.
-        let open_button = gtk::Button::builder().label("Open").build();
-        // Give the click handler its own handle to the window, so it can be
-        // the parent of the file dialog.
+        // 6. Clone the window for the file dialog parent.
         let window_for_dialog = window.clone();
+
+        // 7. The Open button + click handler.
+        let open_button = gtk::Button::builder().label("Open").build();
 
         open_button.connect_clicked(move |_| {
             let dialog = gtk::FileDialog::new();
@@ -55,7 +56,23 @@ fn main() -> adw::glib::ExitCode {
                     Ok(file) => {
                         if let Some(path) = file.path() {
                             println!("Selected: {}", path.display());
-                            welcome_for_result.set_text(&path.display().to_string());
+
+                            match certilens_pdf::inspect(&path) {
+                                Ok(info) => {
+                                    let summary = format!(
+                                        "{}\n\nPages: {}\nObjects: {}\nSignatures: {}",
+                                        path.display(),
+                                        info.pages,
+                                        info.object_count,
+                                        info.signature_fields.len(),
+                                    );
+                                    welcome_for_result.set_text(&summary);
+                                }
+                                Err(err) => {
+                                    welcome_for_result
+                                        .set_text(&format!("Failed to inspect PDF:\n{err}"));
+                                }
+                            }
                         } else {
                             welcome_for_result.set_text("Selected a non-file resource");
                         }
@@ -70,13 +87,13 @@ fn main() -> adw::glib::ExitCode {
 
         header.pack_start(&open_button);
 
-        // 7. Put the welcome label into the ToolbarView's content slot.
+        // 8. Put the welcome label into the ToolbarView's content slot.
         toolbar_view.set_content(Some(&welcome));
 
-        // 8. Attach the ToolbarView to the window as its child.
+        // 9. Attach the ToolbarView to the window as its child.
         window.set_content(Some(&toolbar_view));
 
-        // 9. Show the window.
+        // 10. Show the window.
         window.present();
     });
 
