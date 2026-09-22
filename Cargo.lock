@@ -131,6 +131,7 @@ dependencies = [
 name = "certilens-gtk"
 version = "0.1.0"
 dependencies = [
+ "cairo-rs 0.22.9",
  "certilens-core",
  "certilens-pdf",
  "certilens-verify",

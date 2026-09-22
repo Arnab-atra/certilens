@@ -1,12 +1,13 @@
 use adw::gio;
 use adw::gtk;
 use adw::prelude::*;
-use certilens_core::VerificationResult;
+use certilens_core::{VerificationResult, VerificationStatus};
 use certilens_verify::{
     Assessment, CertificateSummary, ChainSummary, CheckOutcome, SignatureReport,
 };
 use libadwaita as adw;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::Once;
 
 const CERTILENS_CSS: &str = include_str!("../resources/styles/certilens.css");
@@ -86,8 +87,146 @@ fn render_pdf_page_to_file(pdf_path: &Path, page: u32) -> Result<PathBuf, String
     Err("pdftoppm produced no output".into())
 }
 
-/// Build a widget that shows the first page of the PDF at `pdf_path`.
-fn build_pdf_view(pdf_path: &Path) -> gtk::Widget {
+/// Severity of an overlay, mapped from the verdict.
+#[derive(Debug, Clone, Copy)]
+enum OverlaySeverity {
+    Ok,
+    Warn,
+    Err,
+}
+
+/// One rectangle to draw on the rendered page.
+#[derive(Debug, Clone)]
+struct OverlayRect {
+    /// [x0, y0, x1, y1] in PDF points, origin bottom-left.
+    rect: [f64; 4],
+    severity: OverlaySeverity,
+}
+
+/// Derive an overlay severity from the overall verdict.
+///
+/// The banner uses CSS classes (ok / warn / err) but the overlay needs a
+/// finer distinction: "Untrusted" gets a yellow badge even though the
+/// banner is red, because the signature itself is valid — only the
+/// certificate chain could not be resolved.
+fn overlay_severity_from_verdict(verdict: &VerificationResult) -> OverlaySeverity {
+    match verdict.status {
+        VerificationStatus::Verified => OverlaySeverity::Ok,
+        VerificationStatus::Untrusted
+        | VerificationStatus::Unknown
+        | VerificationStatus::Unsupported => OverlaySeverity::Warn,
+        // Invalid, Modified, Expired, Revoked, Error → red
+        _ => OverlaySeverity::Err,
+    }
+}
+
+/// Draw the colored badge and subtle highlight for one signature.
+///
+/// All coordinates are in image pixels. `page_height_img` is the height
+/// of the rendered page image, used to flip the Y axis.
+fn draw_signature_overlay(
+    ctx: &gtk::cairo::Context,
+    rect_pt: [f64; 4],
+    scale: f64,
+    page_height_img: f64,
+    severity: OverlaySeverity,
+) {
+    let [x0, y0, x1, y1] = rect_pt;
+
+    // PDF points → image pixels, with Y flip.
+    let ix0 = x0 * scale;
+    let iy_top = page_height_img - y1 * scale;
+    let ix1 = x1 * scale;
+    let iy_bottom = page_height_img - y0 * scale;
+    let w = ix1 - ix0;
+    let h = iy_bottom - iy_top;
+
+    let (r, g, b) = match severity {
+        OverlaySeverity::Ok => (0.18, 0.76, 0.49),   // #2ec27e
+        OverlaySeverity::Warn => (0.96, 0.76, 0.07), // #f5c211
+        OverlaySeverity::Err => (0.88, 0.11, 0.14),  // #e01b24
+    };
+
+    // 1. Very faint tint over the signature region so the user can
+    //    see which part of the page was verified.
+    ctx.set_source_rgba(r, g, b, 0.05);
+    ctx.rectangle(ix0, iy_top, w, h);
+    let _ = ctx.fill();
+
+    // 2. Thin dashed outline — subtle, but marks the boundary.
+    ctx.set_source_rgba(r, g, b, 0.55);
+    ctx.set_line_width(1.5);
+    ctx.set_dash(&[6.0, 4.0], 0.0);
+    ctx.rectangle(ix0, iy_top, w, h);
+    let _ = ctx.stroke();
+    ctx.set_dash(&[], 0.0); // reset dash pattern for subsequent drawing
+
+    // 3. Badge — a compact circle at the top-right corner, floating
+    //    just outside the rectangle like Acrobat's verification icon.
+    let badge_r = 14.0;
+    let bx = ix1 - 4.0;
+    let by = iy_top + 4.0;
+
+    // Soft drop shadow to lift the badge off the page content.
+    ctx.set_source_rgba(0.0, 0.0, 0.0, 0.18);
+    ctx.arc(
+        bx + 1.0,
+        by + 1.5,
+        badge_r + 1.5,
+        0.0,
+        2.0 * std::f64::consts::PI,
+    );
+    let _ = ctx.fill();
+
+    // Solid colored circle.
+    ctx.arc(bx, by, badge_r, 0.0, 2.0 * std::f64::consts::PI);
+    ctx.set_source_rgba(r, g, b, 1.0);
+    let _ = ctx.fill();
+
+    // Thin white ring for contrast against any background color.
+    ctx.arc(bx, by, badge_r - 0.5, 0.0, 2.0 * std::f64::consts::PI);
+    ctx.set_source_rgba(1.0, 1.0, 1.0, 0.85);
+    ctx.set_line_width(1.5);
+    let _ = ctx.stroke();
+
+    // Icon inside the badge — white glyph, sized for a 14px radius.
+    ctx.set_source_rgba(1.0, 1.0, 1.0, 1.0);
+    ctx.set_line_width(2.5);
+    ctx.set_line_cap(gtk::cairo::LineCap::Round);
+    ctx.set_line_join(gtk::cairo::LineJoin::Round);
+
+    match severity {
+        OverlaySeverity::Ok => {
+            // Checkmark
+            ctx.move_to(bx - 6.0, by);
+            ctx.line_to(bx - 1.5, by + 4.5);
+            ctx.line_to(bx + 6.0, by - 5.0);
+            let _ = ctx.stroke();
+        }
+        OverlaySeverity::Warn => {
+            // Exclamation: stem + dot
+            ctx.move_to(bx, by - 6.0);
+            ctx.line_to(bx, by + 1.5);
+            let _ = ctx.stroke();
+            ctx.new_path();
+            ctx.arc(bx, by + 6.0, 1.4, 0.0, 2.0 * std::f64::consts::PI);
+            let _ = ctx.fill();
+        }
+        OverlaySeverity::Err => {
+            // X
+            ctx.move_to(bx - 5.5, by - 5.5);
+            ctx.line_to(bx + 5.5, by + 5.5);
+            let _ = ctx.stroke();
+            ctx.move_to(bx + 5.5, by - 5.5);
+            ctx.line_to(bx - 5.5, by + 5.5);
+            let _ = ctx.stroke();
+        }
+    }
+}
+
+/// Build a widget that shows the first page of the PDF with overlays.
+fn build_pdf_view(pdf_path: &Path, overlays: Vec<OverlayRect>) -> gtk::Widget {
+    // 1. Render the page to a temp PNG.
     let png_path = match render_pdf_page_to_file(pdf_path, 1) {
         Ok(p) => p,
         Err(e) => {
@@ -102,32 +241,57 @@ fn build_pdf_view(pdf_path: &Path) -> gtk::Widget {
         }
     };
 
-    let texture = match gtk::gdk::Texture::from_filename(&png_path) {
-        Ok(t) => t,
-        Err(e) => {
-            let label = gtk::Label::new(Some(&format!("Could not load page image: {e}")));
-            return label.upcast();
+    // 2. Load it as a Cairo image surface.
+    let surface = {
+        let file = match std::fs::File::open(&png_path) {
+            Ok(f) => f,
+            Err(e) => {
+                let label = gtk::Label::new(Some(&format!("Could not open page image: {e}")));
+                return label.upcast();
+            }
+        };
+        let mut reader = std::io::BufReader::new(file);
+        match gtk::cairo::ImageSurface::create_from_png(&mut reader) {
+            Ok(s) => s,
+            Err(e) => {
+                let label = gtk::Label::new(Some(&format!("Could not decode page image: {e}")));
+                return label.upcast();
+            }
         }
     };
 
-    let picture = gtk::Picture::for_paintable(&texture);
-    picture.set_can_shrink(true);
-    picture.set_content_fit(gtk::ContentFit::Contain);
+    let img_w = surface.width();
+    let img_h = surface.height();
 
+    let surface_rc = Rc::new(surface);
+    let surface_for_draw = surface_rc.clone();
+    let overlays_for_draw = overlays.clone();
+
+    // 3. DrawingArea at the image's exact pixel size.
+    let area = gtk::DrawingArea::new();
+    area.set_content_width(img_w);
+    area.set_content_height(img_h);
+    area.set_draw_func(move |_, ctx, _w, _h| {
+        // Paint the page.
+        let _ = ctx.set_source_surface(surface_for_draw.as_ref(), 0.0, 0.0);
+        let _ = ctx.paint();
+
+        // Overlay the signature rectangles.
+        let scale = 150.0 / 72.0;
+        let page_h_img = img_h as f64;
+        for ov in &overlays_for_draw {
+            draw_signature_overlay(ctx, ov.rect, scale, page_h_img, ov.severity);
+        }
+    });
+
+    // 4. Wrap in a scrolled window.
     let scrolled = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Automatic)
         .vscrollbar_policy(gtk::PolicyType::Automatic)
         .vexpand(true)
         .hexpand(true)
         .build();
-
-    let padded = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    padded.set_margin_top(16);
-    padded.set_margin_bottom(16);
-    padded.set_margin_start(16);
-    padded.set_margin_end(16);
-    padded.append(&picture);
-    scrolled.set_child(Some(&padded));
+    scrolled.set_child(Some(&area));
 
     scrolled.upcast()
 }
@@ -565,7 +729,17 @@ fn install_open_action(
                                 let sidebar_widget = build_results_view(&assessment);
                                 sidebar_for_result.set_child(Some(&sidebar_widget));
 
-                                let pdf_widget = build_pdf_view(&path);
+                                // Build the overlay list from the assessment.
+                                let severity = overlay_severity_from_verdict(&assessment.verdict);
+                                let overlays: Vec<OverlayRect> = assessment
+                                    .signatures
+                                    .iter()
+                                    .filter_map(|r| {
+                                        r.rect.map(|rect| OverlayRect { rect, severity })
+                                    })
+                                    .collect();
+
+                                let pdf_widget = build_pdf_view(&path, overlays);
                                 content_for_result.set_child(Some(&pdf_widget));
 
                                 split_view_for_result.set_show_sidebar(true);

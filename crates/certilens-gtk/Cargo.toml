@@ -12,3 +12,4 @@ certilens-pdf = { path = "../certilens-pdf" }
 certilens-verify = { path = "../certilens-verify" }
 certilens-core = { path = "../certilens-core" }
 poppler = { version = "0.6.0", features = ["render"] }
+cairo-rs = { version = "0.22", features = ["png"] }
