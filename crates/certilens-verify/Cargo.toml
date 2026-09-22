@@ -1,0 +1,12 @@
+[package]
+name = "certilens-verify"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+certilens-core = { path = "../certilens-core" }
+certilens-pdf = { path = "../certilens-pdf" }
+certilens-crypto = { path = "../certilens-crypto" }
+thiserror.workspace = true

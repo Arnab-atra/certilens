@@ -134,6 +134,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "certilens-verify"
+version = "0.1.0"
+dependencies = [
+ "certilens-core",
+ "certilens-crypto",
+ "certilens-pdf",
+ "thiserror",
+]
+
+[[package]]
 name = "cfg-expr"
 version = "0.20.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
