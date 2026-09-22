@@ -1,0 +1,26 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/certilens-core",
+    "crates/certilens-pdf",
+    "crates/certilens-crypto",
+    "crates/certilens-python",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["CertiLens contributors"]
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+pyo3 = { version = "0.22", features = ["extension-module", "abi3-py310"] }
+lopdf = "0.34"
+sha2 = { version = "0.10", features = ["oid"] }
+cms = "0.2"
+der = "0.7"
+x509-cert = "0.2"
+rsa = "0.9"

@@ -1,0 +1,13 @@
+[package]
+name = "certilens-crypto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+sha2 = { workspace = true, features = ["oid"] }
+cms.workspace = true
+der.workspace = true
+x509-cert.workspace = true
+rsa.workspace = true

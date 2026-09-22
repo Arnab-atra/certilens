@@ -1,0 +1,697 @@
+//! PDF-specific inspection.
+//!
+//! This crate answers "what is inside this PDF?" — not "is it authentic?".
+//! Authenticity decisions belong to `certilens-crypto` (Phase 2) and
+//! `certilens-core` (Phase 3).
+
+use serde::{Deserialize, Serialize};
+use std::path::Path;
+
+/// Errors that can occur while reading a PDF.
+#[derive(Debug, thiserror::Error)]
+pub enum PdfError {
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("PDF parse error: {0}")]
+    Parse(#[from] lopdf::Error),
+}
+
+/// A signature field discovered in the PDF's AcroForm.
+///
+/// This is *not* a verified signature — it's just a form field that
+/// claims to be a signature. Phase 1d will attach its ByteRange.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignatureField {
+    /// Fully-qualified name, e.g. "Form.Signature1".
+    pub name: String,
+    /// Object ID of the field's dictionary, if it was an indirect object.
+    pub object_id: u32,
+    /// True if the field has a `/V` (a value — i.e. it was actually signed).
+    pub has_value: bool,
+}
+
+/// Crypto-relevant details extracted from a signature's /V dictionary.
+///
+/// Everything here is a *claim by the document*. Nothing has been verified.
+/// Phase 2 will check these claims cryptographically.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignatureDetails {
+    /// Which AcroForm field this belongs to.
+    pub field_name: String,
+
+    /// Object ID of the /V signature dictionary.
+    pub object_id: u32,
+
+    /// /Filter — the signature handler, e.g. "Adobe.PPKLite".
+    pub filter: Option<String>,
+
+    /// /SubFilter — how /Contents is encoded,
+    /// e.g. "adbe.pkcs7.detached".
+    pub sub_filter: Option<String>,
+
+    /// /Name — claimed signer name. NOT verified.
+    pub claimed_signer: Option<String>,
+
+    /// /M — claimed signing time (PDF date string). NOT verified.
+    pub claimed_time: Option<String>,
+
+    /// /Reason — free-text "why signed".
+    pub reason: Option<String>,
+
+    /// /Location — free-text "where signed".
+    pub location: Option<String>,
+
+    /// /ByteRange — typically [start1, length1, start2, length2].
+    pub byte_range: Option<Vec<i64>>,
+
+    /// Size, in bytes, of the decoded CMS blob.
+    pub contents_size: usize,
+
+    /// File offset of the `<` that opens /Contents.
+    pub contents_offset: Option<u64>,
+
+    /// Length, in bytes, of the hex string between `<` and `>`.
+    pub contents_hex_length: Option<u64>,
+}
+
+/// A high-level summary of a PDF file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PdfInfo {
+    pub version: String,
+    pub pages: usize,
+    pub encrypted: bool,
+    pub object_count: usize,
+    pub signature_fields: Vec<SignatureField>,
+    pub signature_details: Vec<SignatureDetails>,
+
+    // Phase 1b additions:
+    pub file_size: usize,
+    pub startxref_offset: Option<u64>,
+    pub eof_marker_count: usize,
+    pub incremental_updates: usize,
+}
+
+/// Read a PDF from disk and produce a summary.
+pub fn inspect(path: &Path) -> Result<PdfInfo, PdfError> {
+    let bytes = std::fs::read(path)?;
+
+    let version = read_version(&bytes).unwrap_or_else(|| "unknown".into());
+
+    let doc = lopdf::Document::load_mem(&bytes)?;
+
+    let pages = doc.get_pages().len();
+    let object_count = doc.objects.len();
+    let encrypted = doc.is_encrypted();
+    let signature_fields = find_signature_fields(&doc);
+    let signature_details = extract_signature_details(&doc, &bytes, &signature_fields);
+
+    let file_size = bytes.len();
+    let startxref_offset = find_startxref_offset(&bytes);
+    let eof_marker_count = count_eof_markers(&bytes);
+    let incremental_updates = eof_marker_count.saturating_sub(1);
+
+    Ok(PdfInfo {
+        version,
+        pages,
+        encrypted,
+        object_count,
+        signature_fields,
+        signature_details,
+        file_size,
+        startxref_offset,
+        eof_marker_count,
+        incremental_updates,
+    })
+}
+
+/// Extract the version from the `%PDF-x.y` header.
+fn read_version(bytes: &[u8]) -> Option<String> {
+    const MARKER: &[u8] = b"%PDF-";
+
+    let window = &bytes[..bytes.len().min(1024)];
+    let start = window.windows(MARKER.len()).position(|w| w == MARKER)?;
+    let after = &window[start + MARKER.len()..];
+
+    let mut end = 0;
+    while end < after.len() && (after[end].is_ascii_digit() || after[end] == b'.') {
+        end += 1;
+    }
+
+    if end == 0 {
+        return None;
+    }
+
+    Some(String::from_utf8_lossy(&after[..end]).into_owned())
+}
+
+/// Walk the AcroForm field tree and collect signature fields.
+fn find_signature_fields(doc: &lopdf::Document) -> Vec<SignatureField> {
+    let mut out = Vec::new();
+
+    let Ok(catalog) = doc.catalog() else {
+        return out;
+    };
+    let Ok(acroform_ref) = catalog.get(b"AcroForm") else {
+        return out;
+    };
+    let Some(acroform) = resolve(doc, acroform_ref).and_then(|o| o.as_dict().ok()) else {
+        return out;
+    };
+    let Ok(fields) = acroform.get(b"Fields").and_then(|o| o.as_array()) else {
+        return out;
+    };
+
+    for field in fields {
+        walk_field(doc, field, "", None, &mut out);
+    }
+    out
+}
+
+/// Follow an indirect reference if needed.
+fn resolve<'a>(doc: &'a lopdf::Document, obj: &'a lopdf::Object) -> Option<&'a lopdf::Object> {
+    match obj {
+        lopdf::Object::Reference(id) => doc.get_object(*id).ok(),
+        other => Some(other),
+    }
+}
+
+/// Recursively walk one field node.
+fn walk_field(
+    doc: &lopdf::Document,
+    field: &lopdf::Object,
+    parent_name: &str,
+    inherited_ft: Option<&[u8]>,
+    out: &mut Vec<SignatureField>,
+) {
+    let object_id = match field {
+        lopdf::Object::Reference(id) => id.0,
+        _ => 0,
+    };
+
+    let Some(dict) = resolve(doc, field).and_then(|o| o.as_dict().ok()) else {
+        return;
+    };
+
+    let partial = dict
+        .get(b"T")
+        .ok()
+        .and_then(|o| o.as_str().ok())
+        .map(|s| String::from_utf8_lossy(s).into_owned())
+        .unwrap_or_default();
+
+    let full_name = match (parent_name.is_empty(), partial.is_empty()) {
+        (true, true) => format!("<unnamed #{object_id}>"),
+        (true, false) => partial.clone(),
+        (false, true) => parent_name.to_string(),
+        (false, false) => format!("{parent_name}.{partial}"),
+    };
+
+    let ft = dict
+        .get(b"FT")
+        .ok()
+        .and_then(|o| o.as_name().ok())
+        .or(inherited_ft);
+
+    let kids = dict.get(b"Kids").and_then(|o| o.as_array()).ok();
+    if let Some(kids) = kids {
+        for kid in kids {
+            walk_field(doc, kid, &full_name, ft, out);
+        }
+    }
+
+    let is_leaf = kids.is_none();
+    if is_leaf && ft == Some(b"Sig") {
+        let has_value = dict.get(b"V").is_ok();
+        out.push(SignatureField {
+            name: full_name,
+            object_id,
+            has_value,
+        });
+    }
+}
+
+/// For each signed field, pull out the crypto-relevant metadata.
+fn extract_signature_details(
+    doc: &lopdf::Document,
+    raw_bytes: &[u8],
+    fields: &[SignatureField],
+) -> Vec<SignatureDetails> {
+    let mut out = Vec::new();
+
+    for field in fields {
+        if !field.has_value {
+            continue;
+        }
+
+        // The field dict might be at the top level, or keyed differently.
+        // We look it up by ID to be safe.
+        let Ok(field_obj) = doc.get_object((field.object_id, 0)) else {
+            continue;
+        };
+        let Some(field_dict) = field_obj.as_dict().ok() else {
+            continue;
+        };
+        let Ok(v_ref) = field_dict.get(b"V") else {
+            continue;
+        };
+        let v_id = match v_ref {
+            lopdf::Object::Reference(id) => *id,
+            _ => continue,
+        };
+
+        let Some(sig_dict) = resolve(doc, v_ref).and_then(|o| o.as_dict().ok()) else {
+            continue;
+        };
+
+        let filter = get_name(sig_dict, b"Filter");
+        let sub_filter = get_name(sig_dict, b"SubFilter");
+        let claimed_signer = get_str(sig_dict, b"Name");
+        let claimed_time = get_str(sig_dict, b"M");
+        let reason = get_str(sig_dict, b"Reason");
+        let location = get_str(sig_dict, b"Location");
+
+        let byte_range = sig_dict
+            .get(b"ByteRange")
+            .ok()
+            .and_then(|o| o.as_array().ok())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|o| o.as_i64().ok())
+                    .collect::<Vec<i64>>()
+            })
+            .filter(|v| !v.is_empty());
+
+        let contents_size = sig_dict
+            .get(b"Contents")
+            .ok()
+            .and_then(|o| o.as_str().ok())
+            .map(|s| s.len())
+            .unwrap_or(0);
+
+        // Locate /Contents in the raw file to record its byte offset.
+        let (contents_offset, contents_hex_length) = find_contents_span(raw_bytes, v_id.0)
+            .map(|(off, len)| (Some(off), Some(len)))
+            .unwrap_or((None, None));
+
+        out.push(SignatureDetails {
+            field_name: field.name.clone(),
+            object_id: v_id.0,
+            filter,
+            sub_filter,
+            claimed_signer,
+            claimed_time,
+            reason,
+            location,
+            byte_range,
+            contents_size,
+            contents_offset,
+            contents_hex_length,
+        });
+    }
+
+    out
+}
+
+/// Read a name from a dict key, e.g. /Filter /Adobe.PPKLite.
+fn get_name(dict: &lopdf::Dictionary, key: &[u8]) -> Option<String> {
+    dict.get(key)
+        .ok()
+        .and_then(|o| o.as_name().ok())
+        .map(|n| String::from_utf8_lossy(n).into_owned())
+}
+
+/// Read a text string from a dict key, e.g. /Name (Alice).
+fn get_str(dict: &lopdf::Dictionary, key: &[u8]) -> Option<String> {
+    dict.get(key)
+        .ok()
+        .and_then(|o| o.as_str().ok())
+        .map(|s| String::from_utf8_lossy(s).into_owned())
+}
+
+/// Find the byte span of the `/Contents <hex>` value for object `object_id`.
+///
+/// Returns `(offset_of_<, length_of_hex_inside_brackets)`.
+fn find_contents_span(raw: &[u8], object_id: u32) -> Option<(u64, u64)> {
+    // Locate "<id> 0 obj".
+    let needle = format!("{object_id} 0 obj");
+    let obj_start = find_subslice(raw, needle.as_bytes())?;
+    let after = &raw[obj_start..];
+
+    // Bound our search to this object.
+    let obj_end = find_subslice(after, b"endobj").unwrap_or(after.len());
+    let obj = &after[..obj_end];
+
+    let contents_pos = find_subslice(obj, b"/Contents")?;
+    let mut i = contents_pos + b"/Contents".len();
+
+    // Skip whitespace.
+    while i < obj.len() && obj[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if i >= obj.len() || obj[i] != b'<' {
+        return None;
+    }
+
+    let hex_start = i + 1;
+    let mut j = hex_start;
+    while j < obj.len() && obj[j] != b'>' {
+        j += 1;
+    }
+    if j >= obj.len() {
+        return None;
+    }
+
+    let offset = (obj_start + i) as u64;
+    let length = (j - hex_start) as u64;
+    Some((offset, length))
+}
+
+/// Decode the hex-encoded `/Contents` value into raw CMS bytes.
+///
+/// * `raw`      — the full PDF file bytes
+/// * `offset`   — byte position of the `<` that opens the hex string
+/// * `hex_len`  — number of hex characters between `<` and `>`
+///
+/// PDFs encode the CMS blob as hex so it survives 7-bit transports.
+/// The blob itself is ASN.1 DER (binary), so we decode here.
+pub fn extract_cms_bytes(raw: &[u8], offset: u64, hex_len: u64) -> Result<Vec<u8>, PdfError> {
+    let offset = offset as usize;
+    let hex_len = hex_len as usize;
+
+    // Bounds check: we need bytes at [offset, offset + 1 + hex_len).
+    let end = offset
+        .checked_add(1)
+        .and_then(|o| o.checked_add(hex_len))
+        .ok_or_else(|| {
+            PdfError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "offset + hex_len overflowed",
+            ))
+        })?;
+
+    if end > raw.len() {
+        return Err(PdfError::Io(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "CMS hex span runs past end of file",
+        )));
+    }
+
+    // The `<` sits at `offset`. The hex digits are the next `hex_len` bytes.
+    let hex_slice = &raw[offset + 1..end];
+
+    let mut out = Vec::with_capacity(hex_len / 2);
+    let mut hi: Option<u8> = None;
+
+    for &b in hex_slice {
+        let nibble = match b {
+            b'0'..=b'9' => b - b'0',
+            b'a'..=b'f' => b - b'a' + 10,
+            b'A'..=b'F' => b - b'A' + 10,
+            // Some writers pad the tail with whitespace; skip it.
+            b' ' | b'\n' | b'\r' | b'\t' => continue,
+            _ => {
+                return Err(PdfError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("non-hex byte {b:#x} in /Contents"),
+                )))
+            }
+        };
+
+        match hi.take() {
+            None => hi = Some(nibble),
+            Some(h) => out.push((h << 4) | nibble),
+        }
+    }
+
+    // A trailing odd nibble would be a malformed hex string — drop it
+    // rather than guess. Real signers always pad even.
+    Ok(out)
+}
+/// Naive substring search. Fine for a few MB; swap for `memchr` later if needed.
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+/// Count every occurrence of `%%EOF` in the file.
+fn count_eof_markers(bytes: &[u8]) -> usize {
+    const MARKER: &[u8] = b"%%EOF";
+    bytes.windows(MARKER.len()).filter(|w| *w == MARKER).count()
+}
+
+/// Locate the `startxref` marker near the end of the file and return
+/// the number that follows it.
+fn find_startxref_offset(bytes: &[u8]) -> Option<u64> {
+    const MARKER: &[u8] = b"startxref";
+    const SCAN: usize = 2048;
+
+    let tail_start = bytes.len().saturating_sub(SCAN);
+    let tail = &bytes[tail_start..];
+
+    let pos = tail.windows(MARKER.len()).rposition(|w| w == MARKER)?;
+
+    let after = &tail[pos + MARKER.len()..];
+
+    let mut i = 0;
+    while i < after.len() && after[i].is_ascii_whitespace() {
+        i += 1;
+    }
+
+    let start = i;
+    while i < after.len() && after[i].is_ascii_digit() {
+        i += 1;
+    }
+
+    if i == start {
+        return None;
+    }
+
+    std::str::from_utf8(&after[start..i]).ok()?.parse().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- Byte-level tests ----------------------------------------------
+
+    #[test]
+    fn counts_no_eof_markers() {
+        assert_eq!(count_eof_markers(b"hello"), 0);
+    }
+
+    #[test]
+    fn counts_one_eof_marker() {
+        assert_eq!(count_eof_markers(b"x\n%%EOF\n"), 1);
+    }
+
+    #[test]
+    fn counts_incremental_updates() {
+        let data = b"a\n%%EOF\nb\n%%EOF\nc\n%%EOF\n";
+        assert_eq!(count_eof_markers(data), 3);
+    }
+
+    #[test]
+    fn finds_startxref_offset() {
+        let data = b"%PDF-1.4\n...\nstartxref\n1234\n%%EOF\n";
+        assert_eq!(find_startxref_offset(data), Some(1234));
+    }
+
+    #[test]
+    fn picks_last_startxref() {
+        let data = b"startxref\n100\n%%EOF\nstartxref\n999\n%%EOF\n";
+        assert_eq!(find_startxref_offset(data), Some(999));
+    }
+
+    #[test]
+    fn returns_none_when_missing() {
+        assert_eq!(find_startxref_offset(b"%PDF-1.4\n%%EOF\n"), None);
+    }
+
+    // ---- Field-walker tests --------------------------------------------
+    //
+    // Build documents programmatically instead of parsing raw bytes.
+    // lopdf requires a valid xref table, which is tedious to hand-compute.
+    // The walker's job is to walk an already-parsed tree, so this tests
+    // exactly the code we care about.
+
+    use lopdf::{dictionary, Object};
+
+    #[test]
+    fn finds_signature_field_in_acroform() {
+        let mut doc = lopdf::Document::new();
+
+        let sig_dict = dictionary! {
+            "FT" => Object::Name(b"Sig".to_vec()),
+            "T"  => Object::string_literal("Signature1"),
+        };
+        let sig_id = doc.add_object(Object::Dictionary(sig_dict));
+
+        let acro_dict = dictionary! {
+            "Fields" => Object::Array(vec![Object::Reference(sig_id)]),
+        };
+        let acro_id = doc.add_object(Object::Dictionary(acro_dict));
+
+        let cat_dict = dictionary! {
+            "Type"     => Object::Name(b"Catalog".to_vec()),
+            "AcroForm" => Object::Reference(acro_id),
+        };
+        let cat_id = doc.add_object(Object::Dictionary(cat_dict));
+
+        doc.trailer.set("Root", Object::Reference(cat_id));
+
+        let fields = find_signature_fields(&doc);
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].name, "Signature1");
+        assert_eq!(fields[0].object_id, sig_id.0);
+        assert!(!fields[0].has_value);
+    }
+
+    #[test]
+    fn inherits_field_type_from_parent() {
+        let mut doc = lopdf::Document::new();
+
+        let child_dict = dictionary! {
+            "T" => Object::string_literal("Child"),
+            "V" => Object::Integer(0),
+        };
+        let child_id = doc.add_object(Object::Dictionary(child_dict));
+
+        let parent_dict = dictionary! {
+            "T"    => Object::string_literal("Form"),
+            "FT"   => Object::Name(b"Sig".to_vec()),
+            "Kids" => Object::Array(vec![Object::Reference(child_id)]),
+        };
+        let parent_id = doc.add_object(Object::Dictionary(parent_dict));
+
+        let acro_dict = dictionary! {
+            "Fields" => Object::Array(vec![Object::Reference(parent_id)]),
+        };
+        let acro_id = doc.add_object(Object::Dictionary(acro_dict));
+
+        let cat_dict = dictionary! {
+            "Type"     => Object::Name(b"Catalog".to_vec()),
+            "AcroForm" => Object::Reference(acro_id),
+        };
+        let cat_id = doc.add_object(Object::Dictionary(cat_dict));
+
+        doc.trailer.set("Root", Object::Reference(cat_id));
+
+        let fields = find_signature_fields(&doc);
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].name, "Form.Child");
+        assert!(fields[0].has_value);
+    }
+
+    #[test]
+    fn ignores_non_signature_fields() {
+        let mut doc = lopdf::Document::new();
+
+        let txt_dict = dictionary! {
+            "FT" => Object::Name(b"Tx".to_vec()),
+            "T"  => Object::string_literal("Name"),
+        };
+        let txt_id = doc.add_object(Object::Dictionary(txt_dict));
+
+        let acro_dict = dictionary! {
+            "Fields" => Object::Array(vec![Object::Reference(txt_id)]),
+        };
+        let acro_id = doc.add_object(Object::Dictionary(acro_dict));
+
+        let cat_dict = dictionary! {
+            "Type"     => Object::Name(b"Catalog".to_vec()),
+            "AcroForm" => Object::Reference(acro_id),
+        };
+        let cat_id = doc.add_object(Object::Dictionary(cat_dict));
+
+        doc.trailer.set("Root", Object::Reference(cat_id));
+
+        assert!(find_signature_fields(&doc).is_empty());
+    }
+
+    #[test]
+    fn extracts_byte_range_and_contents_size() {
+        let mut doc = lopdf::Document::new();
+
+        let sig_dict = dictionary! {
+            "Type"      => Object::Name(b"Sig".to_vec()),
+            "Filter"    => Object::Name(b"Adobe.PPKLite".to_vec()),
+            "SubFilter" => Object::Name(b"adbe.pkcs7.detached".to_vec()),
+            "ByteRange" => Object::Array(vec![
+                Object::Integer(0),
+                Object::Integer(100),
+                Object::Integer(200),
+                Object::Integer(50),
+            ]),
+            "Contents"  => Object::String(vec![0u8; 16], lopdf::StringFormat::Hexadecimal),
+        };
+        let sig_id = doc.add_object(Object::Dictionary(sig_dict));
+
+        let field_dict = dictionary! {
+            "FT" => Object::Name(b"Sig".to_vec()),
+            "T"  => Object::string_literal("Sig1"),
+            "V"  => Object::Reference(sig_id),
+        };
+        let field_id = doc.add_object(Object::Dictionary(field_dict));
+
+        let acro_dict = dictionary! {
+            "Fields" => Object::Array(vec![Object::Reference(field_id)]),
+        };
+        let acro_id = doc.add_object(Object::Dictionary(acro_dict));
+
+        let cat_dict = dictionary! {
+            "Type"     => Object::Name(b"Catalog".to_vec()),
+            "AcroForm" => Object::Reference(acro_id),
+        };
+        let cat_id = doc.add_object(Object::Dictionary(cat_dict));
+
+        doc.trailer.set("Root", Object::Reference(cat_id));
+
+        let fields = find_signature_fields(&doc);
+        assert_eq!(fields.len(), 1);
+        assert!(fields[0].has_value);
+
+        let details = extract_signature_details(&doc, b"", &fields);
+        assert_eq!(details.len(), 1);
+        assert_eq!(details[0].field_name, "Sig1");
+        assert_eq!(
+            details[0].sub_filter.as_deref(),
+            Some("adbe.pkcs7.detached")
+        );
+        assert_eq!(details[0].byte_range, Some(vec![0, 100, 200, 50]));
+        assert_eq!(details[0].contents_size, 16);
+    }
+
+    #[test]
+    fn extracts_cms_bytes_from_hex() {
+        // `<` at offset 0; "4E6F77" hex = "Now" bytes; `>` after.
+        // Real /Contents is much longer, but this exercises the decoder.
+        let raw = b"<4E6F77>";
+        let bytes = extract_cms_bytes(raw, 0, 6).expect("decode");
+        assert_eq!(bytes, b"Now");
+    }
+
+    #[test]
+    fn handles_lowercase_hex() {
+        let raw = b"<cafebabe>";
+        let bytes = extract_cms_bytes(raw, 0, 8).expect("decode");
+        assert_eq!(bytes, vec![0xCA, 0xFE, 0xBA, 0xBE]);
+    }
+
+    #[test]
+    fn rejects_run_past_eof() {
+        let raw = b"<abcd";
+        assert!(extract_cms_bytes(raw, 0, 100).is_err());
+    }
+
+    #[test]
+    fn skips_whitespace_inside_hex() {
+        // Some writers wrap long hex strings across lines.
+        let raw = b"<4E 6F\n77>";
+        let bytes = extract_cms_bytes(raw, 0, 8).expect("decode");
+        assert_eq!(bytes, b"Now");
+    }
+}
