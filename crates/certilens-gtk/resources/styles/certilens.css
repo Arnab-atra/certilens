@@ -1,0 +1,30 @@
+.verdict-banner {
+  padding: 18px 22px;
+  margin: 24px;
+  border-radius: 12px;
+}
+
+.verdict-banner.ok {
+  background-color: alpha(#2ec27e, 0.15);
+  border-left: 5px solid #2ec27e;
+}
+
+.verdict-banner.warn {
+  background-color: alpha(#f5c211, 0.18);
+  border-left: 5px solid #f5c211;
+}
+
+.verdict-banner.err {
+  background-color: alpha(#e01b24, 0.15);
+  border-left: 5px solid #e01b24;
+}
+
+.verdict-headline {
+  font-weight: 700;
+  font-size: 1.35em;
+}
+
+.verdict-subtitle {
+  font-size: 0.95em;
+  opacity: 0.85;
+}

@@ -108,6 +108,7 @@ dependencies = [
 name = "certilens-gtk"
 version = "0.1.0"
 dependencies = [
+ "certilens-core",
  "certilens-pdf",
  "certilens-verify",
  "gtk4",
