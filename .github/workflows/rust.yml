@@ -23,12 +23,17 @@ jobs:
             pkg-config \
             libglib2.0-dev \
             libgtk-4-dev \
+            libgdk4.0-dev \
             libadwaita-1-dev \
             libcairo2-dev \
             libgdk-pixbuf-2.0-dev \
             libpango1.0-dev \
             libgraphene-1.0-dev \
             libpoppler-glib-dev
+
+          pkg-config --modversion gtk4
+          pkg-config --modversion gdk4
+          pkg-config --modversion gdk4-wayland || true
 
       - name: Build
         run: cargo build --verbose
