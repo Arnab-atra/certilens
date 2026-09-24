@@ -14,14 +14,14 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - name: Install native GTK dependencies
+      - name: Install GTK dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --yes \
+          sudo apt-get install -y \
             pkg-config \
-            libglib2.0-dev \
             libgtk-4-dev \
             libadwaita-1-dev \
             libcairo2-dev \
@@ -30,9 +30,11 @@ jobs:
             libgraphene-1.0-dev \
             libpoppler-glib-dev
 
+      - name: Check GTK installation
+        run: |
           pkg-config --modversion gtk4
           pkg-config --modversion gdk4
-          pkg-config --modversion gdk4-wayland || true
+          pkg-config --modversion libadwaita-1
 
       - name: Build
         run: cargo build --verbose
