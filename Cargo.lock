@@ -150,6 +150,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "certilens-render"
+version = "0.1.0"
+dependencies = [
+ "cairo-rs 0.22.9",
+ "pkg-config",
+ "thiserror",
+]
+
+[[package]]
 name = "certilens-verify"
 version = "0.1.0"
 dependencies = [

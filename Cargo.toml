@@ -5,7 +5,7 @@ members = [
     "crates/certilens-pdf",
     "crates/certilens-crypto",
     "crates/certilens-verify",
-    "crates/certilens-gtk",
+    "crates/certilens-gtk", "crates/certilens-render",
 ]
 
 [workspace.package]
