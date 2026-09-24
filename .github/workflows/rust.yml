@@ -30,9 +30,9 @@ jobs:
             libgraphene-1.0-dev \
             libpoppler-glib-dev
 
-          pkg-config --modversion gtk4.0
-          pkg-config --modversion gdk4.0
-          pkg-config --modversion gdk4.0-wayland || true
+          pkg-config --modversion gtk4
+          pkg-config --modversion gdk4
+          pkg-config --modversion gdk4-wayland || true
 
       - name: Build
         run: cargo build --verbose
