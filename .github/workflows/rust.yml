@@ -17,11 +17,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install GTK dependencies
+      - name: Install native GTK dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
+          sudo apt-get install --yes \
             pkg-config \
+            libglib2.0-dev \
             libgtk-4-dev \
             libadwaita-1-dev \
             libcairo2-dev \
@@ -30,7 +31,7 @@ jobs:
             libgraphene-1.0-dev \
             libpoppler-glib-dev
 
-      - name: Check GTK installation
+      - name: Verify GTK installation
         run: |
           pkg-config --modversion gtk4
           pkg-config --modversion gdk4
