@@ -9,3 +9,8 @@ authors.workspace = true
 x509-cert.workspace = true
 der.workspace = true
 thiserror.workspace = true
+lopdf.workspace = true
+tempfile = "3"
+
+[dev-dependencies]
+certilens-pdf = { path = "../certilens-pdf" }

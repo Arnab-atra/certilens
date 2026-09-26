@@ -4,8 +4,9 @@
 //! verification logic against known inputs:
 //!
 //! - Test certificates (`certs`)
-//! - (future) PDF generation
+//! - PDF generation (`pdf`)
 //! - (future) PDF signing
 //! - (future) end-to-end test cases
 
 pub mod certs;
+pub mod pdf;
