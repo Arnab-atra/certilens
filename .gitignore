@@ -11,3 +11,9 @@
 .DS_Store
 .idea/
 .vscode/
+
+# Test PKI — regenerate with crates/certilens-testkit/testdata/generate.sh
+crates/certilens-testkit/testdata/*.key
+crates/certilens-testkit/testdata/*.crt
+crates/certilens-testkit/testdata/*.srl
+crates/certilens-testkit/testdata/*.csr

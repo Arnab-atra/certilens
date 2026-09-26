@@ -179,6 +179,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "certilens-testkit"
+version = "0.1.0"
+dependencies = [
+ "der",
+ "thiserror 1.0.69",
+ "x509-cert",
+]
+
+[[package]]
 name = "certilens-verify"
 version = "0.1.0"
 dependencies = [

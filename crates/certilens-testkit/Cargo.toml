@@ -1,0 +1,11 @@
+[package]
+name = "certilens-testkit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+x509-cert.workspace = true
+der.workspace = true
+thiserror.workspace = true
