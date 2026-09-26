@@ -38,7 +38,13 @@ pub struct SignatureDetails {
     pub location: Option<String>,
     pub byte_range: Option<Vec<i64>>,
     pub contents_size: usize,
+
+    /// Byte offset in the raw PDF file where /Contents value starts.
+    /// Used internally to extract CMS bytes from the hex stream.
     pub contents_offset: Option<u64>,
+
+    /// Length in bytes of the hex-encoded content value.
+    /// /Contents might be (hex string) or <hex string> — this is the inner content length.
     pub contents_hex_length: Option<u64>,
 
     // ---- Where does this signature appear? ----
@@ -401,6 +407,9 @@ pub fn extract_cms_bytes(raw: &[u8], offset: u64, hex_len: u64) -> Result<Vec<u8
     let offset = offset as usize;
     let hex_len = hex_len as usize;
 
+    // Calculate the end of the hex content span.
+    // offset points to '<', so hex content starts at offset + 1.
+    // We need: offset (for '<') + 1 (content start) + hex_len
     let end = offset
         .checked_add(1)
         .and_then(|o| o.checked_add(hex_len))
@@ -698,5 +707,12 @@ mod tests {
         let raw = b"<4E 6F\n77>";
         let bytes = extract_cms_bytes(raw, 0, 8).expect("decode");
         assert_eq!(bytes, b"Now");
+    }
+
+    #[test]
+    fn handles_mixed_case_hex() {
+        let raw = b"<CaFeBaBe>";
+        let bytes = extract_cms_bytes(raw, 0, 8).expect("decode");
+        assert_eq!(bytes, vec![0xCA, 0xFE, 0xBA, 0xBE]);
     }
 }

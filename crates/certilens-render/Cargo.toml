@@ -1,0 +1,13 @@
+[package]
+name = "certilens-render"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+cairo-rs = { version = "0.22", features = ["png"] }
+
+[build-dependencies]
+pkg-config = "0.3"

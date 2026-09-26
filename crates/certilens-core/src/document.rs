@@ -23,6 +23,9 @@ impl Document {
     ///
     /// This does *no* verification. It only answers
     /// "what kind of file does this look like?"
+    /// Note: The file is checked for existence but not locked.
+    /// If the file is deleted/moved after this call but before use.
+    /// operations on this Document will fail gracefully.
     pub fn open(path: impl Into<PathBuf>) -> std::io::Result<Self> {
         let path = path.into();
         // Ensure the file exists.
@@ -40,7 +43,7 @@ impl Document {
         Ok(Self { path, format })
     }
 
-    /// A short human-readable lable for the UI.
+    /// A short human-readable label for the UI.
     pub fn format_label(&self) -> &'static str {
         match self.format {
             DocumentFormat::Pdf => "PDF",

@@ -1,10 +1,10 @@
 //! CertiLens verification orchestration.
 //!
-//! Ties together the PDF parser, the crypto layer, and the trust store,
-//! and produces a single `Assessment` — a verdict plus per-signature
-//! evidence.
+//! This crate coordinates PDF inspection and cryptographic verification.
+//! CMS/X.509 implementation details remain inside `certilens-crypto`.
 
 use std::path::Path;
+use std::sync::OnceLock;
 
 use certilens_core::{VerificationResult, VerificationStatus};
 
@@ -17,17 +17,14 @@ pub enum VerifyError {
     Pdf(#[from] certilens_pdf::PdfError),
 }
 
-/// Top-level result: a verdict, plus the evidence behind it.
 #[derive(Debug)]
 pub struct Assessment {
     pub verdict: VerificationResult,
     pub signatures: Vec<SignatureReport>,
 }
 
-/// Everything we learned about one signature.
 #[derive(Debug)]
 pub struct SignatureReport {
-    // Claims from the PDF dictionary
     pub field_name: String,
     pub filter: Option<String>,
     pub sub_filter: Option<String>,
@@ -37,19 +34,14 @@ pub struct SignatureReport {
     pub location: Option<String>,
     pub byte_range: Option<Vec<i64>>,
     pub contents_size: usize,
-
-    // Where does this signature appear on the page?
     pub rect: Option<[f64; 4]>,
     pub page_number: Option<usize>,
-
-    // Check results
     pub integrity: CheckOutcome,
     pub signature: CheckOutcome,
     pub certificate: CertificateSummary,
     pub chain: ChainSummary,
 }
 
-/// The outcome of a single check (integrity, signature, ...).
 #[derive(Debug)]
 pub struct CheckOutcome {
     pub passed: bool,
@@ -62,12 +54,11 @@ impl CheckOutcome {
         Self {
             passed: false,
             summary: "not run".into(),
-            details: vec![],
+            details: Vec::new(),
         }
     }
 }
 
-/// Summary of the signer's certificate.
 #[derive(Debug, Default)]
 pub struct CertificateSummary {
     pub present: bool,
@@ -83,7 +74,6 @@ pub struct CertificateSummary {
     pub signing_time_note: Option<String>,
 }
 
-/// Summary of the certificate chain walk.
 #[derive(Debug, Default)]
 pub struct ChainSummary {
     pub reached_trusted_root: bool,
@@ -103,23 +93,45 @@ pub struct ChainLinkSummary {
     pub error: Option<String>,
 }
 
-/// Run every available check on the document at `path`.
+/// Load the system trust store once and cache the certificates.
+fn system_trust_certificates() -> &'static [x509_cert::Certificate] {
+    static TRUST_CERTS: OnceLock<Vec<x509_cert::Certificate>> = OnceLock::new();
+
+    TRUST_CERTS.get_or_init(
+        || match certilens_crypto::trust::TrustStore::load_system() {
+            Ok(store) => {
+                eprintln!(
+                    "Loaded system trust store from {:?} ({} certificates)",
+                    store.source_path, store.count
+                );
+                store.all_certificates()
+            }
+            Err(e) => {
+                eprintln!("Could not load system trust store: {e}");
+                Vec::new()
+            }
+        },
+    )
+}
+
+/// Verify a PDF document.
 pub fn assess(path: &Path) -> Result<Assessment, VerifyError> {
     let raw = std::fs::read(path)?;
     let info = certilens_pdf::inspect(path)?;
 
-    let mut issues: Vec<String> = Vec::new();
-    let mut reports: Vec<SignatureReport> = Vec::new();
-    let mut any_sig = false;
+    let mut issues = Vec::new();
+    let mut reports = Vec::new();
 
+    let mut any_signature = false;
     let mut crypto_ok = true;
     let mut validity_ok = true;
     let mut chain_ok = true;
 
-    let trust_store = certilens_crypto::trust::TrustStore::load_system().ok();
+    // Load system CAs once for the whole document.
+    let trust_certs = system_trust_certificates();
 
     for (idx, sig) in info.signature_details.iter().enumerate() {
-        any_sig = true;
+        any_signature = true;
 
         let mut report = SignatureReport {
             field_name: sig.field_name.clone(),
@@ -139,273 +151,318 @@ pub fn assess(path: &Path) -> Result<Assessment, VerifyError> {
             chain: ChainSummary::default(),
         };
 
-        // ---- Extract CMS bytes ----
-        let (off, hex_len) = match (sig.contents_offset, sig.contents_hex_length) {
-            (Some(a), Some(b)) => (a, b),
-            _ => {
-                let msg = format!("Signature #{idx}: /Contents offset unknown");
+        // ---------------------------------------------------------------
+        // CMS extraction
+        // ---------------------------------------------------------------
+
+        let (contents_offset, contents_hex_length) =
+            match (sig.contents_offset, sig.contents_hex_length) {
+                (Some(offset), Some(length)) => (offset, length),
+                _ => {
+                    let msg = format!("Signature #{idx}: /Contents offset unknown");
+
+                    issues.push(msg.clone());
+
+                    report.integrity = CheckOutcome {
+                        passed: false,
+                        summary: msg,
+                        details: Vec::new(),
+                    };
+
+                    crypto_ok = false;
+                    reports.push(report);
+                    continue;
+                }
+            };
+
+        let cms = match certilens_pdf::extract_cms_bytes(&raw, contents_offset, contents_hex_length)
+        {
+            Ok(cms) => cms,
+            Err(error) => {
+                let msg = format!("Signature #{idx}: could not extract CMS: {error}");
+
                 issues.push(msg.clone());
+
                 report.integrity = CheckOutcome {
                     passed: false,
                     summary: msg,
-                    details: vec![],
+                    details: Vec::new(),
                 };
+
                 crypto_ok = false;
                 reports.push(report);
                 continue;
             }
         };
 
-        let cms = match certilens_pdf::extract_cms_bytes(&raw, off, hex_len) {
-            Ok(c) => c,
-            Err(e) => {
-                let msg = format!("Signature #{idx}: could not extract CMS: {e}");
-                issues.push(msg.clone());
-                report.integrity = CheckOutcome {
-                    passed: false,
-                    summary: msg,
-                    details: vec![],
-                };
-                crypto_ok = false;
-                reports.push(report);
-                continue;
-            }
-        };
+        // ---------------------------------------------------------------
+        // ByteRange
+        // ---------------------------------------------------------------
 
-        let br = match sig.byte_range.as_ref() {
-            Some(b) => b,
+        let byte_range = match sig.byte_range.as_ref() {
+            Some(range) => range,
             None => {
                 let msg = format!("Signature #{idx}: no ByteRange");
+
                 issues.push(msg.clone());
+
                 report.integrity = CheckOutcome {
                     passed: false,
                     summary: msg,
-                    details: vec![],
+                    details: Vec::new(),
                 };
+
                 crypto_ok = false;
                 reports.push(report);
                 continue;
             }
         };
 
-        // ---- Integrity (SHA-256 of ByteRange vs CMS digest) ----
-        report.integrity = match certilens_crypto::check_digest(&raw, br, &cms) {
-            Ok(d) if d.matches => CheckOutcome {
+        // ---------------------------------------------------------------
+        // Document digest
+        // ---------------------------------------------------------------
+
+        report.integrity = match certilens_crypto::check_digest(&raw, byte_range, &cms) {
+            Ok(result) if result.matches => CheckOutcome {
                 passed: true,
-                summary: format!("{} digest matches", d.algorithm.unwrap_or("SHA-256")),
-                details: vec![format!("Computed: {}", hex(&d.computed))],
+                summary: format!("{} digest matches", result.algorithm),
+                details: vec![format!("Computed: {}", hex(&result.computed))],
             },
-            Ok(d) => {
-                let msg = format!(
-                    "Signature #{idx}: SHA-256 digest MISMATCH — document was modified after signing"
-                );
-                issues.push(msg.clone());
+
+            Ok(result) => {
+                let msg = format!("Signature #{idx}: digest mismatch");
+
+                issues.push(msg);
+
                 crypto_ok = false;
+
                 CheckOutcome {
                     passed: false,
-                    summary: "digest mismatch — document was modified".into(),
+                    summary: "digest mismatch — signed document bytes differ".into(),
                     details: vec![
-                        format!("Computed:   {}", hex(&d.computed)),
-                        format!("CMS claims: {}", hex(&d.claimed)),
+                        format!("Computed:   {}", hex(&result.computed)),
+                        format!("CMS claims: {}", hex(&result.claimed)),
                     ],
                 }
             }
-            Err(e) => {
-                let msg = format!("Signature #{idx}: digest check failed: {e}");
+
+            Err(error) => {
+                let msg = format!("Signature #{idx}: digest check failed: {error}");
+
                 issues.push(msg.clone());
+
                 crypto_ok = false;
+
                 CheckOutcome {
                     passed: false,
                     summary: msg,
-                    details: vec![],
+                    details: Vec::new(),
                 }
             }
         };
 
-        // ---- Signature (RSA over signed attributes) ----
+        // ---------------------------------------------------------------
+        // CMS signature
+        // ---------------------------------------------------------------
+
         report.signature = match certilens_crypto::verify_signer_signature(&cms) {
-            Ok(r) if r.valid => CheckOutcome {
+            Ok(result) if result.valid => CheckOutcome {
                 passed: true,
                 summary: format!(
                     "{} signature verifies ({} bytes)",
-                    r.digest_algorithm.unwrap_or("RSA"),
-                    r.signature_length,
+                    result.digest_algorithm.unwrap_or("RSA-SHA256"),
+                    result.signature_length
                 ),
-                details: vec![],
+                details: Vec::new(),
             },
-            Ok(r) => {
-                let detail = r
+
+            Ok(result) => {
+                let detail = result
                     .error
                     .clone()
                     .unwrap_or_else(|| "signature did not verify".into());
-                let msg = format!("Signature #{idx}: cryptographic signature INVALID — {detail}");
-                issues.push(msg.clone());
+
+                let msg = format!(
+                    "Signature #{idx}: cryptographic signature invalid — \
+                         {detail}"
+                );
+
+                issues.push(msg);
+
                 crypto_ok = false;
+
                 CheckOutcome {
                     passed: false,
                     summary: detail,
-                    details: vec![],
+                    details: Vec::new(),
                 }
             }
-            Err(e) => {
-                let msg = format!("Signature #{idx}: signature verify error: {e}");
+
+            Err(error) => {
+                let msg = format!("Signature #{idx}: signature verification error: {error}");
+
                 issues.push(msg.clone());
+
                 crypto_ok = false;
+
                 CheckOutcome {
                     passed: false,
                     summary: msg,
-                    details: vec![],
+                    details: Vec::new(),
                 }
             }
         };
 
-        // ---- Certificate ----
-        match certilens_crypto::extract_signer_certificate(&cms) {
-            Ok(cert) => {
-                let mut summary = CertificateSummary {
-                    present: true,
-                    subject: cert.subject.clone(),
-                    issuer: cert.issuer.clone(),
-                    serial: cert.serial_hex.clone(),
-                    not_before: cert.not_before.clone(),
-                    not_after: cert.not_after.clone(),
-                    public_key_algo: cert.public_key_algorithm_name.unwrap_or("unknown").into(),
-                    signature_algo: cert.signature_algorithm_name.unwrap_or("unknown").into(),
-                    der_length: cert.der_length,
-                    validity_note: String::new(),
-                    signing_time_note: None,
-                };
+        // ---------------------------------------------------------------
+        // Signer certificate
+        // ---------------------------------------------------------------
 
-                if cert.is_expired {
-                    summary.validity_note = format!("expired {}", cert.not_after);
-                } else if cert.currently_valid {
-                    summary.validity_note = "currently valid".into();
-                } else {
-                    summary.validity_note = format!("not yet valid (starts {})", cert.not_before);
-                }
+        let signer = match certilens_crypto::extract_signer_certificate(&cms) {
+            Ok(value) => value,
+            Err(error) => {
+                let msg = format!("Signature #{idx}: no signer certificate: {error}");
 
-                if cert.is_expired {
-                    if let Some(claimed) = sig.claimed_time.as_deref() {
-                        if claimed.starts_with("D:") && claimed.len() >= 10 {
-                            let claimed_ymd = &claimed[2..10];
-                            let not_after_ymd: String = cert
-                                .not_after
-                                .chars()
-                                .filter(|c| c.is_ascii_digit())
-                                .take(8)
-                                .collect();
-                            if claimed_ymd > not_after_ymd.as_str() {
-                                summary.signing_time_note = Some(format!(
-                                    "claimed signing time ({claimed}) is AFTER certificate expiry"
-                                ));
-                                issues.push(format!(
-                                    "Signature #{idx}: certificate expired {} but the claimed signing time is {}",
-                                    cert.not_after, claimed
-                                ));
-                                validity_ok = false;
-                            }
-                        }
-                    }
-                }
-
-                report.certificate = summary;
-            }
-            Err(e) => {
-                let msg = format!("Signature #{idx}: no signer certificate: {e}");
                 issues.push(msg.clone());
                 validity_ok = false;
+
                 report.certificate = CertificateSummary {
+                    present: false,
                     validity_note: msg,
                     ..Default::default()
                 };
-            }
-        }
 
-        // ---- Chain ----
-        match certilens_crypto::verify_certificate_chain(&cms, trust_store.as_ref()) {
-            Ok(cr) => {
-                let mut chain_summary = ChainSummary {
-                    reached_trusted_root: cr.reached_trusted_root,
-                    root_subject: cr.root_subject.clone(),
-                    missing_issuer: cr.missing_issuer.clone(),
-                    links: cr
-                        .links
-                        .iter()
-                        .map(|l| ChainLinkSummary {
-                            subject: l.subject.clone(),
-                            issuer: l.issuer.clone(),
-                            verified: l.signature_verified,
-                            self_signed: l.self_signed,
-                            from_trust_store: l.from_trust_store,
-                            error: l.error.clone(),
-                        })
-                        .collect(),
-                    note: String::new(),
-                };
-
-                if cr.reached_trusted_root {
-                    chain_summary.note = "chain verified to a trusted root".into();
-                } else if let Some(m) = &cr.missing_issuer {
-                    chain_summary.note = format!("issuer not found: {m}");
-                    issues.push(format!(
-                        "Signature #{idx}: certificate chain incomplete — issuer not found in CMS or trust store: {m}"
-                    ));
-                    chain_ok = false;
-                } else if cr.reaches_root {
-                    chain_summary.note =
-                        "chain reaches a self-signed root not in the trust store".into();
-                    issues.push(format!(
-                        "Signature #{idx}: certificate chain incomplete — chain reaches a self-signed root not in the trust store"
-                    ));
-                    chain_ok = false;
-                } else {
-                    chain_summary.note = "chain does not reach a trusted root".into();
-                    issues.push(format!(
-                        "Signature #{idx}: certificate chain incomplete — chain does not reach a trusted root"
-                    ));
-                    chain_ok = false;
-                }
-
-                report.chain = chain_summary;
+                reports.push(report);
+                continue;
             }
-            Err(e) => {
-                let msg = format!("Signature #{idx}: chain verify error: {e}");
-                issues.push(msg.clone());
-                chain_ok = false;
-                report.chain = ChainSummary {
-                    note: msg,
-                    ..Default::default()
-                };
-            }
-        }
+        };
+
+        // The crypto crate owns the X.509 implementation type. Convert it
+        // into a display-friendly public structure there.
+        let certificate_info = certilens_crypto::certificate_summary(&signer.certificate);
+
+        report.certificate = CertificateSummary {
+            present: true,
+            subject: certificate_info.subject,
+            issuer: certificate_info.issuer,
+            serial: certificate_info.serial,
+            not_before: certificate_info.not_before,
+            not_after: certificate_info.not_after,
+            public_key_algo: certificate_info.public_key_algo,
+            signature_algo: certificate_info.signature_algo,
+            der_length: certificate_info.der_length,
+            validity_note: certificate_info.validity_note,
+            signing_time_note: None,
+        };
+
+        // ---------------------------------------------------------------
+        // Certificate chain (with system trust store)
+        // ---------------------------------------------------------------
+
+        let chain = certilens_crypto::verify_certificate_chain_from_cms(
+            &signer.certificate,
+            &cms,
+            trust_certs,
+        );
+
+        let links = chain
+            .links
+            .iter()
+            .map(|link| ChainLinkSummary {
+                subject: link.subject.clone(),
+                issuer: link.issuer.clone(),
+                verified: link.signature_valid,
+                self_signed: link.subject == link.issuer,
+                from_trust_store: link.trusted,
+                error: link.error.clone(),
+            })
+            .collect::<Vec<_>>();
+
+        let root_subject = chain
+            .links
+            .iter()
+            .rev()
+            .find(|link| link.subject == link.issuer)
+            .map(|link| link.subject.clone());
+
+        let missing_issuer = chain
+            .error
+            .as_deref()
+            .filter(|error| error.to_ascii_lowercase().contains("issuer"))
+            .map(str::to_owned);
+
+        let note = if chain.trusted {
+            "certificate chain verified to a trusted certificate".into()
+        } else if chain.valid {
+            chain_ok = false;
+
+            issues.push(format!(
+                "Signature #{idx}: certificate chain is cryptographically \
+                 valid but trust could not be established"
+            ));
+
+            "certificate chain signatures are valid, but no trusted \
+             certificate was found in the system store"
+                .into()
+        } else if let Some(error) = chain.error.as_deref() {
+            chain_ok = false;
+
+            issues.push(format!(
+                "Signature #{idx}: certificate chain verification failed: \
+                 {error}"
+            ));
+
+            format!("certificate chain verification failed: {error}")
+        } else {
+            chain_ok = false;
+
+            issues.push(format!(
+                "Signature #{idx}: certificate chain could not be established"
+            ));
+
+            "certificate chain could not be established".into()
+        };
+
+        report.chain = ChainSummary {
+            reached_trusted_root: chain.trusted,
+            root_subject,
+            missing_issuer,
+            links,
+            note,
+        };
 
         reports.push(report);
     }
 
-    // ---- Verdict ----
-    let (status, headline, subtitle) = if !any_sig {
+    // ---------------------------------------------------------------
+    // Final verdict
+    // ---------------------------------------------------------------
+
+    let (status, headline, subtitle) = if !any_signature {
         (
             VerificationStatus::Unknown,
             "No digital signatures found",
-            "The document does not claim to be signed. Nothing to verify.",
+            "The document does not contain a digital signature that \
+             CertiLens can verify.",
         )
     } else if !crypto_ok {
         (
             VerificationStatus::Invalid,
             "Signature invalid",
-            "The cryptographic signature or content digest did not verify.",
+            "The cryptographic signature or signed document digest \
+             did not verify.",
         )
     } else if !validity_ok || !chain_ok {
         (
             VerificationStatus::Untrusted,
             "Signature valid, trust unresolved",
-            "The content and signature check out. Trust could not be established.",
+            "The cryptographic signature is valid, but certificate \
+             validity or trust could not be fully established.",
         )
     } else {
         (
             VerificationStatus::Verified,
             "Signature verified",
-            "All checks passed.",
+            "The signature and certificate checks passed.",
         )
     };
 
@@ -421,5 +478,5 @@ pub fn assess(path: &Path) -> Result<Assessment, VerifyError> {
 }
 
 fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }

@@ -85,10 +85,7 @@ impl TrustStore {
             let block = &rest[start..end];
 
             if let Ok(cert) = Certificate::from_pem(block) {
-                // `format_dn` isn't public in lib.rs; we use the same
-                // string-key idea by hashing the DN's Debug render. To keep
-                // things simple for the lookup, we instead key by the
-                // DER-encoded Name.
+                // Key by the DER-encoded Name for a stable lookup.
                 let key = dn_key(&cert.tbs_certificate.subject);
                 by_subject.entry(key).or_default().push(cert);
                 count += 1;
@@ -118,6 +115,14 @@ impl TrustStore {
     /// True if any certificate in the store has this subject key.
     pub fn contains_subject_key(&self, dn_key: &str) -> bool {
         self.by_subject.contains_key(dn_key)
+    }
+
+    /// Return an owned copy of every certificate in the store.
+    pub fn all_certificates(&self) -> Vec<Certificate> {
+        self.by_subject
+            .values()
+            .flat_map(|v| v.iter().cloned())
+            .collect()
     }
 }
 

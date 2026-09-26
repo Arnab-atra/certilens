@@ -11,3 +11,5 @@ cms.workspace = true
 der.workspace = true
 x509-cert.workspace = true
 rsa.workspace = true
+reqwest.workspace = true
+base64 = "0.22"
